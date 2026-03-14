@@ -217,7 +217,47 @@ Interpretation:
 - they are not enough to keep all radar/camera/SBS dependencies happy
 - this lines up with the expectation that radar-track disappearance affects additional systems beyond the cruise command path itself
 
-### 3. Forward idle-creep test passed
+### 3. Exit handoff did not eliminate stored faults
+
+An exit handoff was added to keep sending `0x21b + 0x21c` briefly after stopping tester-present, while waiting for radar tracks to return.
+
+Observed result:
+
+- quiet camera/SBS warnings still appeared during the active run
+- the loud front-radar warning still fired once the run ended
+
+Interpretation:
+
+- teardown timing is not the only issue
+- real faults are still being set during the active replacement window
+
+### 4. DTC reads confirm real radar/camera/DSC faults
+
+Post-test DTC reads showed:
+
+- radar module at `0x764`:
+  - `U023A00`
+  - `U030109`
+  - `U031609`
+- forward camera at `0x706`:
+  - multiple confirmed CAN communication and invalid-data faults
+- DSC/ABS at `0x760`:
+  - `U023A00`
+  - `U040500`
+  - `U010400`
+
+The most important practical conclusion is:
+
+- the warnings are not just cosmetic cluster behavior
+- the car is storing real faults in the radar, camera, and DSC path
+- the DSC fault aligns with the observed degradation of ACC behavior at low speed after testing
+
+This points to two likely root causes:
+
+1. The replacement `0x21b` / `0x21c` pair is accepted well enough to function temporarily, but message integrity is not yet good enough to avoid module complaints.
+2. Suppressing radar tracks without replacing them is creating secondary camera/SBS/DSC failures even if the core cruise-command path survives.
+
+### 5. Forward idle-creep test passed
 
 A low-risk forward-creep test in `Drive` with:
 
@@ -251,6 +291,7 @@ The following statements are now supported by direct evidence on this `2022 CX-5
 6. That partial replacement can survive at least:
    - parked neutral test
    - forward idle-creep test
+7. The current implementation still sets real radar/camera/DSC DTCs and cannot yet be treated as a clean handoff.
 
 ## What Is Still Not Proven
 
@@ -262,6 +303,7 @@ These questions remain open:
 4. Can the system be kept alive cleanly for long enough without post-run faults?
 5. Is there a cleaner exit strategy that hands control back without immediate radar faults?
 6. Are radar-track replays needed to keep the camera/SBS path happy even if longitudinal itself only needs `0x21b + 0x21c`?
+7. Is the current `CRZ_INFO` patch/checksum logic accurate enough, or is imperfect `0x21b` fidelity causing part of the DSC complaint?
 
 ## Current Working Hypothesis
 
@@ -286,9 +328,19 @@ That is a much narrower problem than "fully emulate the entire radar ECU immedia
 
 ## Immediate Next Tests
 
-The next priority is not more disable work. It is first proving actual longitudinal influence.
+The next priority is not more disable work. It is first isolating message-fidelity faults, then proving actual longitudinal influence.
 
-### Step 1: Tiny positive accel pulses
+### Step 1: Replay captured `CRZ_INFO` unchanged
+
+Before more accel testing, run the same replacement path with captured `CRZ_INFO` replayed unchanged.
+
+Goal:
+
+- determine whether the current faults are caused mainly by:
+  - patched `0x21b` / checksum behavior
+  - or missing radar-track / perception-side messages
+
+### Step 2: Tiny positive accel pulses
 
 Test:
 
@@ -305,7 +357,7 @@ Goal:
 
 - determine whether the vehicle responds beyond normal idle creep
 
-### Step 2: Determine whether `0x21b` alone is enough for actuation
+### Step 3: Determine whether `0x21b` alone is enough for actuation
 
 If tiny positive pulses do nothing:
 
@@ -316,7 +368,7 @@ If tiny positive pulses do nothing:
   3. then revisit `0xfd`
   4. then `0x167` if needed
 
-### Step 3: Separate longitudinal acceptance from radar/camera fault cleanup
+### Step 4: Separate longitudinal acceptance from radar/camera fault cleanup
 
 Do not block on solving every warning first.
 

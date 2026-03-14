@@ -218,6 +218,7 @@ class MazdaLongitudinalReplayMutator:
                        *,
                        profile: MazdaLongitudinalProfile | None = None,
                        info_accel_cmd: float | None = None,
+                       crz_speed_kph: float | None = None,
                        gas_cmd: float | None = None,
                        unsafe_patch_events: bool = False) -> MazdaLongitudinalCommandSet:
     base = self.stream.commands[self.index]
@@ -233,6 +234,7 @@ class MazdaLongitudinalReplayMutator:
       base,
       profile=profile,
       crz_info_accel_cmd=info_accel_cmd,
+      crz_events_crz_speed=crz_speed_kph,
       gas_cmd=gas_cmd,
       crz_events_accel_cmd=crz_events_accel_cmd,
       crz_events_accel_low_res=crz_events_accel_low_res,
@@ -243,12 +245,14 @@ class MazdaLongitudinalReplayMutator:
                     *,
                     profile: MazdaLongitudinalProfile | None = None,
                     info_accel_cmd: float | None = None,
+                    crz_speed_kph: float | None = None,
                     gas_cmd: float | None = None,
                     unsafe_patch_events: bool = False,
                     bus: int = 0) -> list[CanData]:
     command_set = self.next_command_set(
       profile=profile,
       info_accel_cmd=info_accel_cmd,
+      crz_speed_kph=crz_speed_kph,
       gas_cmd=gas_cmd,
       unsafe_patch_events=unsafe_patch_events,
     )
@@ -258,6 +262,7 @@ class MazdaLongitudinalReplayMutator:
                           *,
                           profile: MazdaLongitudinalProfile | None = None,
                           info_accel_cmd: float | None = None,
+                          crz_speed_kph: float | None = None,
                           gas_cmd: float | None = None,
                           unsafe_patch_events: bool = False,
                           bus: int = 0) -> list[CanData]:
@@ -265,6 +270,7 @@ class MazdaLongitudinalReplayMutator:
       self.pending_command_set = self.next_command_set(
         profile=profile,
         info_accel_cmd=info_accel_cmd,
+        crz_speed_kph=crz_speed_kph,
         gas_cmd=gas_cmd,
         unsafe_patch_events=unsafe_patch_events,
       )

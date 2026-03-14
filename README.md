@@ -8,6 +8,8 @@ Mazda longitudinal reverse-engineering notes, helper scripts, and experimental P
   Shorter shareable status summary for Discord/forums.
 - [`docs/MAZDA_LONGITUDINAL_RESEARCH.md`](https://github.com/yummydirtx/op-mazda-testkit/blob/main/docs/MAZDA_LONGITUDINAL_RESEARCH.md)
   Full research notes, message findings, and implementation history.
+- [`docs/MAZDA_LONGITUDINAL_UPDATE_2026-03-13.md`](https://github.com/yummydirtx/op-mazda-testkit/blob/main/docs/MAZDA_LONGITUDINAL_UPDATE_2026-03-13.md)
+  Newer on-car testing update covering radar suppression, replacement runner changes, DTC cleanup, and current blockers.
 - [`examples/`](https://github.com/yummydirtx/op-mazda-testkit/tree/main/examples)
   Offline analyzers, replay extractors, UDS probes, and Panda test runners.
 - [`opendbc/car/mazda/longitudinal_experimental.py`](https://github.com/yummydirtx/op-mazda-testkit/blob/main/opendbc/car/mazda/longitudinal_experimental.py)
@@ -23,6 +25,8 @@ Mazda longitudinal reverse-engineering notes, helper scripts, and experimental P
   - `0x21c`
   - radar tracks `0x361` to `0x366`
 - Replacing only `0x21b + 0x21c` was enough to pass parked and forward-creep neutral tests while the radar session was actively held open.
+- The newer runner can now persist logs locally, drive Mazda `SET-` / `RESUME` button pulses, and log enough state to debug tests after an SSH disconnect.
+- `examples/clear_mazda_warnings.py` now provides a Mazda-specific before/clear/after DTC cleanup flow for the common affected ECUs.
 
 ## Scope
 

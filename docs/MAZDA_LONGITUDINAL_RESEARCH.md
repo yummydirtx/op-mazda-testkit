@@ -707,15 +707,15 @@ The following local tools now exist to support continued work:
 Suggested usage:
 
 ```bash
-cd /path/to/op-mazda-testkit
-PYTHONPATH=/path/to/op-mazda-testkit \
-python examples/analyze_mazda_acc_rlog.py /path/to/rloglead.zst
+/path/to/op-mazda-testkit \
+python \
+examples/analyze_mazda_acc_rlog.py rloglead.zst
 ```
 
 ```bash
-cd /path/to/op-mazda-testkit
-PYTHONPATH=/path/to/op-mazda-testkit \
-python examples/compare_mazda_acc_rlogs.py /path/to/rlogmainonaccoff.zst /path/to/rlognolead.zst
+/path/to/op-mazda-testkit \
+python \
+examples/compare_mazda_acc_rlogs.py rlogmainonaccoff.zst rlognolead.zst
 ```
 
 ## Bottom Line
