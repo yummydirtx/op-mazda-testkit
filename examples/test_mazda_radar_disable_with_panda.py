@@ -27,8 +27,14 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--bus", type=int, default=0, help="CAN bus for UDS/radar")
   parser.add_argument("--addr", type=lambda x: int(x, 0), default=0x764, help="Radar UDS address")
   parser.add_argument("--can-speed-kbps", type=int, default=500, help="CAN speed in kbps")
-  parser.add_argument("--observe-seconds", type=float, default=3.0, help="Seconds to count target frames before and after disable")
-  parser.add_argument("--hold-seconds", type=float, default=8.0, help="Seconds to keep tester present active after disable")
+  parser.add_argument("--observe-seconds", type=float,
+                      help="Legacy alias that sets both --before-seconds and --during-seconds to the same value")
+  parser.add_argument("--before-seconds", type=float, default=3.0,
+                      help="Seconds to count target frames before entering the diagnostic session")
+  parser.add_argument("--during-seconds", type=float, default=3.0,
+                      help="Seconds to count target frames while holding tester-present active")
+  parser.add_argument("--progress-interval", type=float, default=0.0,
+                      help="Print a progress line every N seconds during the active hold; 0 disables")
   parser.add_argument("--disable-rx-too", action="store_true", help="Use DISABLE_RX_DISABLE_TX (0x28 03 01) instead of ENABLE_RX_DISABLE_TX (0x28 01 01)")
   parser.add_argument("--session", choices=tuple(SESSION_BY_NAME), default="extended", help="Diagnostic session to enter before communication-control")
   parser.add_argument("--try-all-sessions", action="store_true", help="Try default, extended, and safety-system sessions until communication-control is accepted")
@@ -60,9 +66,12 @@ def count_addrs(panda: Panda, bus: int, seconds: float) -> Counter[int]:
   return counts
 
 
-def count_addrs_with_tester_present(panda: Panda, bus: int, addr: int, seconds: float, tester_present_interval: float = 0.5) -> Counter[int]:
+def count_addrs_with_tester_present(panda: Panda, bus: int, addr: int, seconds: float,
+                                    tester_present_interval: float = 0.5,
+                                    progress_interval: float = 0.0) -> Counter[int]:
   deadline = time.monotonic() + seconds
   next_tester_present = time.monotonic()
+  next_progress = time.monotonic() + progress_interval if progress_interval > 0 else float("inf")
   counts: Counter[int] = Counter()
   panda.can_clear(0xFFFF)
   while time.monotonic() < deadline:
@@ -70,6 +79,15 @@ def count_addrs_with_tester_present(panda: Panda, bus: int, addr: int, seconds: 
     if now >= next_tester_present:
       send_tester_present_suppress_response(panda, bus, addr)
       next_tester_present = now + tester_present_interval
+    if now >= next_progress:
+      elapsed = seconds - max(deadline - now, 0.0)
+      track_total = sum(counts[target_addr] for target_addr in TARGET_ADDRS if 0x361 <= target_addr <= 0x366)
+      print(
+        f"  hold progress: t={elapsed:.1f}s/{seconds:.1f}s "
+        f"0x21b={counts[0x21B]} 0x21c={counts[0x21C]} 0x21f={counts[0x21F]} "
+        f"0xfd={counts[0x0FD]} 0x167={counts[0x167]} radar_tracks={track_total}"
+      )
+      next_progress = now + progress_interval
 
     for rx_addr, _dat, src in panda.can_recv():
       if src == bus and rx_addr in TARGET_ADDRS:
@@ -103,6 +121,9 @@ def main() -> None:
   if not args.allow_aeb_risk:
     print("--allow-aeb-risk is required. Disabling the radar may disable high-speed AEB.")
     sys.exit(1)
+  if args.observe_seconds is not None:
+    args.before_seconds = args.observe_seconds
+    args.during_seconds = args.observe_seconds
 
   ensure_pandad_stopped()
 
@@ -116,8 +137,8 @@ def main() -> None:
   session_entered = False
 
   try:
-    before_counts = count_addrs(panda, args.bus, args.observe_seconds)
-    report.append(format_counts("Before disable:", before_counts, args.observe_seconds))
+    before_counts = count_addrs(panda, args.bus, args.before_seconds)
+    report.append(format_counts("Before disable:", before_counts, args.before_seconds))
 
     client = uds.UdsClient(panda, args.addr, bus=args.bus)
     report.append(f"\nUDS session start: addr={hex(args.addr)} bus={args.bus} control_type={control_type.name}")
@@ -145,10 +166,13 @@ def main() -> None:
           report.append(f"  communication_control failed: {e!r}")
 
       if disable_succeeded or args.session_only:
-        observed_counts = count_addrs_with_tester_present(panda, args.bus, args.addr, args.observe_seconds)
+        observed_counts = count_addrs_with_tester_present(
+          panda, args.bus, args.addr, args.during_seconds,
+          progress_interval=args.progress_interval,
+        )
         report.append("")
         title = "During active session:" if args.session_only and not disable_succeeded else "During disable hold:"
-        report.append(format_counts(title, observed_counts, args.observe_seconds))
+        report.append(format_counts(title, observed_counts, args.during_seconds))
         report.append("\nTarget message deltas:")
         for addr in TARGET_ADDRS:
           before = before_counts[addr]
@@ -158,9 +182,9 @@ def main() -> None:
         break
 
     if not (disable_succeeded or args.session_only):
-      after_counts = count_addrs(panda, args.bus, args.observe_seconds)
+      after_counts = count_addrs(panda, args.bus, args.before_seconds)
       report.append("")
-      report.append(format_counts("After disable:", after_counts, args.observe_seconds))
+      report.append(format_counts("After disable:", after_counts, args.before_seconds))
 
       report.append("\nTarget message deltas:")
       for addr in TARGET_ADDRS:
