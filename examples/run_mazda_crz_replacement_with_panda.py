@@ -120,6 +120,10 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--radar-addr", type=lambda x: int(x, 0), default=0x764, help="Radar UDS address")
   parser.add_argument("--tester-present-interval", type=float, default=0.5, help="Seconds between raw 0x3E80 tester-present frames")
   parser.add_argument("--handoff-seconds", type=float, default=2.0, help="After stopping tester-present, keep sending 0x21b/0x21c for this long or until radar tracks return")
+  parser.add_argument("--handoff-end-on", choices=("radar_tracks", "stock_pair", "stock_pair_and_tracks"), default="stock_pair_and_tracks",
+                      help="Condition that ends the exit handoff early instead of waiting the full handoff timeout")
+  parser.add_argument("--handoff-stock-pair-count", type=int, default=3,
+                      help="How many stock 0x21b and 0x21c frames must be observed during handoff before stock-pair restoration is considered stable")
   parser.add_argument("--replay-pre-session-radar", action="store_true", help="Capture the current 0x361-0x366 burst before entering programming session and replay it at 10 Hz while the radar is suppressed")
   parser.add_argument("--replace-events", action="store_true", help="Also send 0x21f CRZ_EVENTS at 50 Hz, 10 ms ahead of 0x21b/0x21c")
   parser.add_argument("--unsafe-patch-events", action="store_true", help="When overriding info_accel_cmd, also approximate-patch 0x21f. CRZ_EVENTS checksum semantics are still unresolved.")
@@ -182,22 +186,27 @@ def send_button_press(panda: Panda, bus: int, packer: CANPacker, counter: int, b
   panda.can_send(addr, dat, msg_bus)
 
 
-def radar_tracks_present(panda: Panda, bus: int) -> bool:
-  for addr, _dat, src in panda.can_recv():
-    if src == bus and 0x361 <= addr <= 0x366:
-      return True
-  return False
-
-
-def drain_can(panda: Panda, bus: int, parser: CANParser | None, rx_counts: Counter[int]) -> None:
+def drain_can(panda: Panda, bus: int, parser: CANParser | None, rx_counts: Counter[int]) -> Counter[int]:
   frames = []
+  seen_addrs: Counter[int] = Counter()
   for addr, dat, src in panda.can_recv():
     if src != bus:
       continue
     rx_counts[addr] += 1
+    seen_addrs[addr] += 1
     frames.append((addr, bytes(dat), src))
   if parser is not None and frames:
     parser.update((int(time.monotonic() * 1e9), frames))
+  return seen_addrs
+
+
+def handoff_ready(mode: str, seen_tracks: bool, stock_pair_counts: Counter[int], minimum_pair_count: int) -> bool:
+  pair_ready = stock_pair_counts[CRZ_INFO_ADDR] >= minimum_pair_count and stock_pair_counts[CRZ_CTRL_ADDR] >= minimum_pair_count
+  if mode == "radar_tracks":
+    return seen_tracks
+  if mode == "stock_pair":
+    return pair_ready
+  return seen_tracks and pair_ready
 
 
 def print_status(prefix: str, parser: CANParser, rx_counts: Counter[int]) -> None:
@@ -274,6 +283,9 @@ def run(args: argparse.Namespace) -> None:
     sys.exit(1)
   if args.engage_button != "none" and args.engage_press_seconds <= 0:
     print("--engage-press-seconds must be > 0 when using --engage-button.")
+    sys.exit(1)
+  if args.handoff_stock_pair_count <= 0:
+    print("--handoff-stock-pair-count must be > 0.")
     sys.exit(1)
 
   ensure_pandad_stopped()
@@ -393,6 +405,10 @@ def run(args: argparse.Namespace) -> None:
 
     if args.handoff_seconds > 0:
       print(f"Starting exit handoff for up to {args.handoff_seconds:.1f}s.")
+      print(
+        f"Handoff will end on {args.handoff_end_on} "
+        f"(stock-pair threshold={args.handoff_stock_pair_count})."
+      )
       handoff_deadline = time.monotonic() + args.handoff_seconds
       next_handoff_send = time.monotonic()
       next_handoff_radar_send = time.monotonic()
@@ -404,14 +420,34 @@ def run(args: argparse.Namespace) -> None:
         unsafe_patch_events=args.unsafe_patch_events if args.replace_events else False,
       )
       handoff_phase = 0
+      stock_pair_counts: Counter[int] = Counter()
+      tracks_seen = False
+      announced_tracks = False
 
       while time.monotonic() < handoff_deadline:
-        if radar_tracks_present(panda, args.bus):
-          print("Radar tracks detected again, ending handoff.")
-          break
-
         now = time.monotonic()
-        drain_can(panda, args.bus, status_parser, rx_counts)
+        handoff_seen = drain_can(panda, args.bus, status_parser, rx_counts)
+        if any(addr in handoff_seen for addr in RADAR_TRACK_ADDRS):
+          tracks_seen = True
+          if not announced_tracks:
+            print("Radar tracks detected during handoff.")
+            announced_tracks = True
+        stock_pair_counts[CRZ_INFO_ADDR] += handoff_seen[CRZ_INFO_ADDR]
+        stock_pair_counts[CRZ_CTRL_ADDR] += handoff_seen[CRZ_CTRL_ADDR]
+        if handoff_ready(args.handoff_end_on, tracks_seen, stock_pair_counts, args.handoff_stock_pair_count):
+          if args.handoff_end_on == "radar_tracks":
+            print("Ending handoff: radar tracks detected again.")
+          elif args.handoff_end_on == "stock_pair":
+            print(
+              "Ending handoff: stock 0x21b/0x21c restored "
+              f"({stock_pair_counts[CRZ_INFO_ADDR]}/{stock_pair_counts[CRZ_CTRL_ADDR]} frames seen)."
+            )
+          else:
+            print(
+              "Ending handoff: radar tracks and stock 0x21b/0x21c restored "
+              f"({stock_pair_counts[CRZ_INFO_ADDR]}/{stock_pair_counts[CRZ_CTRL_ADDR]} frames seen)."
+            )
+          break
         if now >= next_handoff_send:
           if args.replace_events and handoff_phase == 0:
             send_events(panda, args.bus, last_command_set)
