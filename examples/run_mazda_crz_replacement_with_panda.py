@@ -120,6 +120,8 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--radar-addr", type=lambda x: int(x, 0), default=0x764, help="Radar UDS address")
   parser.add_argument("--tester-present-interval", type=float, default=0.5, help="Seconds between raw 0x3E80 tester-present frames")
   parser.add_argument("--handoff-seconds", type=float, default=2.0, help="After stopping tester-present, keep sending 0x21b/0x21c for this long or until radar tracks return")
+  parser.add_argument("--exit-default-session", action="store_true",
+                      help="After handoff, explicitly request UDS default session on the radar before returning Panda to silent mode")
   parser.add_argument("--handoff-end-on", choices=("radar_tracks", "stock_pair", "stock_pair_and_tracks"), default="stock_pair_and_tracks",
                       help="Condition that ends the exit handoff early instead of waiting the full handoff timeout")
   parser.add_argument("--handoff-stock-pair-count", type=int, default=3,
@@ -465,6 +467,13 @@ def run(args: argparse.Namespace) -> None:
           print_tx_status(f"handoff+{args.handoff_seconds - (handoff_deadline - now):.1f}s", last_command_set)
           next_handoff_status = now + args.status_interval
         time.sleep(0.001)
+    if args.exit_default_session:
+      try:
+        print("Requesting radar return to UDS default session.")
+        client.diagnostic_session_control(uds.SESSION_TYPE.DEFAULT)
+        print("Radar default-session request accepted.")
+      except Exception as e:
+        print(f"Radar default-session request failed: {e!r}")
   finally:
     panda.set_safety_mode(CarParams.SafetyModel.silent)
     print("Panda returned to silent safety mode.")

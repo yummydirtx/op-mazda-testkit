@@ -39,6 +39,8 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--session", choices=tuple(SESSION_BY_NAME), default="extended", help="Diagnostic session to enter before communication-control")
   parser.add_argument("--try-all-sessions", action="store_true", help="Try default, extended, and safety-system sessions until communication-control is accepted")
   parser.add_argument("--session-only", action="store_true", help="Do not send communication-control. Hold the chosen diagnostic session and observe traffic while tester-present is active.")
+  parser.add_argument("--exit-default-session", action="store_true",
+                      help="After the hold, explicitly request UDS default session on the radar before returning Panda to silent mode")
   parser.add_argument("--allow-aeb-risk", action="store_true", help="Required. Radar disable may remove high-speed AEB.")
   parser.add_argument("--output", type=Path, help="Optional text output file")
   return parser.parse_args()
@@ -197,6 +199,13 @@ def main() -> None:
       report.append("\nNo tested diagnostic session accepted COMMUNICATION_CONTROL.")
     elif args.session_only and session_entered:
       report.append("\nSession-only probe completed.")
+
+    if args.exit_default_session and session_entered:
+      try:
+        client.diagnostic_session_control(uds.SESSION_TYPE.DEFAULT)
+        report.append("Radar default-session request accepted.")
+      except Exception as e:
+        report.append(f"Radar default-session request failed: {e!r}")
 
   finally:
     panda.set_safety_mode(CarParams.SafetyModel.silent)
