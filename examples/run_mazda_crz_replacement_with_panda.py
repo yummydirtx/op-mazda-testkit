@@ -8,7 +8,7 @@ import json
 import sys
 import time
 import traceback
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 from subprocess import CalledProcessError, check_output
 from types import SimpleNamespace
@@ -67,6 +67,7 @@ SESSION_BY_NAME: dict[str, uds.SESSION_TYPE] = {
 RADAR_TRACK_ADDRS: tuple[int, ...] = (0x361, 0x362, 0x363, 0x364, 0x365, 0x366)
 RADAR_REPLAY_ADDRS: tuple[int, ...] = RADAR_TRACK_ADDRS + (0x499,)
 RADAR_REPLAY_HZ = 10.0
+DEFAULT_SAMPLE_ADDRS: tuple[int, ...] = (CRZ_INFO_ADDR, CRZ_CTRL_ADDR, CRZ_EVENTS_ADDR, 0x0FD, 0x167) + RADAR_REPLAY_ADDRS
 STATUS_MESSAGES: tuple[tuple[str, int], ...] = (
   ("CRZ_CTRL", 50),
   ("CRZ_EVENTS", 50),
@@ -108,6 +109,10 @@ def default_log_path() -> Path:
   return root / f"mazda_crz_replacement_{stamp}.log"
 
 
+def default_sample_path(log_path: Path) -> Path:
+  return log_path.with_suffix(".samples.json")
+
+
 def parse_args() -> argparse.Namespace:
   parser = argparse.ArgumentParser(
     description="Hold Mazda radar in a diagnostic session and replace suppressed CRZ_INFO/CRZ_CTRL frames through Panda."
@@ -141,6 +146,12 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--engage-repeat-interval", type=float, default=0.75, help="Seconds between repeated engage button presses")
   parser.add_argument("--status-interval", type=float, default=0.5, help="Print decoded Mazda CAN status every N seconds. Set 0 to disable.")
   parser.add_argument("--log-file", type=Path, default=default_log_path(), help="Local file to append runner output to so logs survive SSH disconnects")
+  parser.add_argument("--sample-output", type=Path,
+                      help="Optional JSON artifact path for timestamped raw-frame samples from active and handoff phases")
+  parser.add_argument("--sample-addrs", type=str,
+                      help="Comma-separated CAN addresses to sample into --sample-output. Defaults to 0x21b,0x21c,0x21f,0xfd,0x167,0x361-0x366,0x499")
+  parser.add_argument("--sample-limit", type=int, default=80,
+                      help="Maximum sampled RX frames to retain per address per phase in --sample-output")
   parser.add_argument("--all-output", action="store_true", help="Required. Sends with Panda allOutput safety mode and disables normal TX safety.")
   return parser.parse_args()
 
@@ -159,6 +170,16 @@ def load_stream(path: Path, profile_override: str | None):
   payload = json.loads(path.read_text())
   profile = MazdaLongitudinalProfile(profile_override or payload["profile"])
   return command_stream_from_hex_sequence(profile, payload["frames"])
+
+
+def parse_addr_csv(value: str | None) -> tuple[int, ...]:
+  if value is None or value.strip() == "":
+    return DEFAULT_SAMPLE_ADDRS
+  return tuple(int(part.strip(), 0) for part in value.split(",") if part.strip())
+
+
+def finalize_phase_samples(samples: dict[int, list[dict[str, object]]]) -> dict[str, list[dict[str, object]]]:
+  return {hex(addr): entries for addr, entries in sorted(samples.items())}
 
 
 def send_tester_present_suppress_response(panda: Panda, bus: int, addr: int) -> None:
@@ -192,17 +213,28 @@ def send_button_press(panda: Panda, bus: int, packer: CANPacker, counter: int, b
   panda.can_send(addr, dat, msg_bus)
 
 
-def drain_can(panda: Panda, bus: int, parser: CANParser | None, rx_counts: Counter[int]) -> Counter[int]:
+def drain_can(panda: Panda,
+              bus: int,
+              parser: CANParser | None,
+              rx_counts: Counter[int],
+              *,
+              sample_addrs: set[int] | None = None,
+              sample_limit: int = 0,
+              samples: dict[int, list[dict[str, object]]] | None = None,
+              phase_start: float | None = None) -> Counter[int]:
   frames = []
   seen_addrs: Counter[int] = Counter()
+  now = time.monotonic()
   for addr, dat, src in panda.can_recv():
     if src != bus:
       continue
     rx_counts[addr] += 1
     seen_addrs[addr] += 1
     frames.append((addr, bytes(dat), src))
+    if sample_addrs and samples is not None and phase_start is not None and addr in sample_addrs and len(samples[addr]) < sample_limit:
+      samples[addr].append({"t": round(now - phase_start, 6), "data": bytes(dat).hex()})
   if parser is not None and frames:
-    parser.update((int(time.monotonic() * 1e9), frames))
+    parser.update((int(now * 1e9), frames))
   return seen_addrs
 
 
@@ -303,12 +335,14 @@ def run(args: argparse.Namespace) -> None:
   mutator = MazdaLongitudinalReplayMutator(stream)
   packer = CANPacker("mazda_2017")
   target_speed_kph = args.target_speed_mph * 1.609344 if args.target_speed_mph is not None else None
+  sample_addrs = set(parse_addr_csv(args.sample_addrs)) if args.sample_output is not None else set()
 
   panda = Panda()
   panda.set_can_speed_kbps(args.bus, args.can_speed_kbps)
   panda.set_safety_mode(CarParams.SafetyModel.allOutput)
   status_parser = CANParser("mazda_2017", list(STATUS_MESSAGES), args.bus) if args.status_interval > 0 else None
   rx_counts: Counter[int] = Counter()
+  phase_samples: dict[str, dict[str, list[dict[str, object]]]] = {}
 
   radar_sequence: list[dict[int, bytes]] | None = None
   if args.replay_pre_session_radar:
@@ -359,9 +393,19 @@ def run(args: argparse.Namespace) -> None:
   try:
     phase = 0
     last_command_set = None
+    active_samples: dict[int, list[dict[str, object]]] = defaultdict(list)
     while args.duration == 0 or (time.monotonic() - start_time) < args.duration:
       now = time.monotonic()
-      drain_can(panda, args.bus, status_parser, rx_counts)
+      drain_can(
+        panda,
+        args.bus,
+        status_parser,
+        rx_counts,
+        sample_addrs=sample_addrs,
+        sample_limit=args.sample_limit,
+        samples=active_samples,
+        phase_start=start_time,
+      )
       if now >= next_tester_present:
         send_tester_present_suppress_response(panda, args.bus, args.radar_addr)
         next_tester_present = now + args.tester_present_interval
@@ -417,6 +461,8 @@ def run(args: argparse.Namespace) -> None:
         next_status = now + args.status_interval
 
     if args.handoff_seconds > 0:
+      if sample_addrs:
+        phase_samples["active"] = finalize_phase_samples(active_samples)
       print(f"Starting exit handoff for up to {args.handoff_seconds:.1f}s.")
       print(
         f"Handoff will end on {args.handoff_end_on} "
@@ -437,10 +483,21 @@ def run(args: argparse.Namespace) -> None:
       stock_pair_counts: Counter[int] = Counter()
       tracks_seen = False
       announced_tracks = False
+      handoff_samples: dict[int, list[dict[str, object]]] = defaultdict(list)
+      handoff_start = time.monotonic()
 
       while time.monotonic() < handoff_deadline:
         now = time.monotonic()
-        handoff_seen = drain_can(panda, args.bus, status_parser, rx_counts)
+        handoff_seen = drain_can(
+          panda,
+          args.bus,
+          status_parser,
+          rx_counts,
+          sample_addrs=sample_addrs,
+          sample_limit=args.sample_limit,
+          samples=handoff_samples,
+          phase_start=handoff_start,
+        )
         if any(addr in handoff_seen for addr in RADAR_TRACK_ADDRS):
           tracks_seen = True
           if not announced_tracks:
@@ -480,6 +537,10 @@ def run(args: argparse.Namespace) -> None:
           print_tx_status(f"handoff+{args.handoff_seconds - (handoff_deadline - now):.1f}s", last_command_set)
           next_handoff_status = now + args.status_interval
         time.sleep(0.001)
+      if sample_addrs:
+        phase_samples["handoff"] = finalize_phase_samples(handoff_samples)
+    elif sample_addrs:
+      phase_samples["active"] = finalize_phase_samples(active_samples)
     if args.exit_default_session:
       try:
         print("Requesting radar return to UDS default session.")
@@ -487,6 +548,28 @@ def run(args: argparse.Namespace) -> None:
         print("Radar default-session request accepted.")
       except Exception as e:
         print(f"Radar default-session request failed: {e!r}")
+    if args.sample_output is not None:
+      args.sample_output.parent.mkdir(parents=True, exist_ok=True)
+      sample_payload = {
+        "stream_json": str(args.stream_json),
+        "profile": stream.profile.value,
+        "bus": args.bus,
+        "session": args.session,
+        "duration": args.duration,
+        "handoff_seconds": args.handoff_seconds,
+        "radar_addr": hex(args.radar_addr),
+        "replay_pre_session_radar": args.replay_pre_session_radar,
+        "radar_replay_capture_seconds": args.radar_replay_capture_seconds,
+        "sample_limit": args.sample_limit,
+        "sample_addrs": [hex(addr) for addr in sorted(sample_addrs)],
+        "captured_radar_sequence": [
+          {hex(addr): dat.hex() for addr, dat in snapshot.items()}
+          for snapshot in (radar_sequence or [])
+        ],
+        "phases": phase_samples,
+      }
+      args.sample_output.write_text(json.dumps(sample_payload, indent=2) + "\n")
+      print(f"Wrote phase samples JSON to {args.sample_output}")
   finally:
     panda.set_safety_mode(CarParams.SafetyModel.silent)
     print("Panda returned to silent safety mode.")
