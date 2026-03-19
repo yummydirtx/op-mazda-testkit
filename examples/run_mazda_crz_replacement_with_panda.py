@@ -182,6 +182,18 @@ def finalize_phase_samples(samples: dict[int, list[dict[str, object]]]) -> dict[
   return {hex(addr): entries for addr, entries in sorted(samples.items())}
 
 
+def append_sample(samples: dict[int, list[dict[str, object]]],
+                  addr: int,
+                  dat: bytes,
+                  *,
+                  phase_start: float,
+                  sample_limit: int,
+                  sample_addrs: set[int]) -> None:
+  if addr not in sample_addrs or len(samples[addr]) >= sample_limit:
+    return
+  samples[addr].append({"t": round(time.monotonic() - phase_start, 6), "data": dat.hex()})
+
+
 def send_tester_present_suppress_response(panda: Panda, bus: int, addr: int) -> None:
   panda.can_send(addr, b"\x02\x3E\x80\x00\x00\x00\x00\x00", bus)
 
@@ -343,6 +355,7 @@ def run(args: argparse.Namespace) -> None:
   status_parser = CANParser("mazda_2017", list(STATUS_MESSAGES), args.bus) if args.status_interval > 0 else None
   rx_counts: Counter[int] = Counter()
   phase_samples: dict[str, dict[str, list[dict[str, object]]]] = {}
+  tx_phase_samples: dict[str, dict[str, list[dict[str, object]]]] = {}
 
   radar_sequence: list[dict[int, bytes]] | None = None
   if args.replay_pre_session_radar:
@@ -394,6 +407,7 @@ def run(args: argparse.Namespace) -> None:
     phase = 0
     last_command_set = None
     active_samples: dict[int, list[dict[str, object]]] = defaultdict(list)
+    active_tx_samples: dict[int, list[dict[str, object]]] = defaultdict(list)
     while args.duration == 0 or (time.monotonic() - start_time) < args.duration:
       now = time.monotonic()
       drain_can(
@@ -410,7 +424,11 @@ def run(args: argparse.Namespace) -> None:
         send_tester_present_suppress_response(panda, args.bus, args.radar_addr)
         next_tester_present = now + args.tester_present_interval
       if radar_sequence is not None and now >= next_radar_send:
-        send_radar_snapshot(panda, args.bus, radar_sequence[radar_sequence_index])
+        current_snapshot = radar_sequence[radar_sequence_index]
+        send_radar_snapshot(panda, args.bus, current_snapshot)
+        if sample_addrs:
+          for replay_addr, replay_dat in current_snapshot.items():
+            append_sample(active_tx_samples, replay_addr, replay_dat, phase_start=start_time, sample_limit=args.sample_limit, sample_addrs=sample_addrs)
         radar_sequence_index = (radar_sequence_index + 1) % len(radar_sequence)
         next_radar_send = now + (1.0 / RADAR_REPLAY_HZ)
       if engage_button != Buttons.NONE and engage_counter < args.engage_repeat:
@@ -433,6 +451,9 @@ def run(args: argparse.Namespace) -> None:
           unsafe_patch_events=args.unsafe_patch_events,
         )
         send_events(panda, args.bus, last_command_set)
+        if sample_addrs:
+          append_sample(active_tx_samples, CRZ_EVENTS_ADDR, last_command_set.raw_21f,
+                        phase_start=start_time, sample_limit=args.sample_limit, sample_addrs=sample_addrs)
         phase = 1
         next_send += 0.01
       else:
@@ -446,6 +467,11 @@ def run(args: argparse.Namespace) -> None:
         if last_command_set is None:
           raise RuntimeError("No command set available for CRZ pair send")
         send_crz_pair(panda, args.bus, last_command_set)
+        if sample_addrs:
+          append_sample(active_tx_samples, CRZ_INFO_ADDR, last_command_set.raw_21b,
+                        phase_start=start_time, sample_limit=args.sample_limit, sample_addrs=sample_addrs)
+          append_sample(active_tx_samples, CRZ_CTRL_ADDR, last_command_set.raw_21c,
+                        phase_start=start_time, sample_limit=args.sample_limit, sample_addrs=sample_addrs)
         phase = 0
         next_send += 0.02 if not args.replace_events else 0.01
 
@@ -463,6 +489,7 @@ def run(args: argparse.Namespace) -> None:
     if args.handoff_seconds > 0:
       if sample_addrs:
         phase_samples["active"] = finalize_phase_samples(active_samples)
+        tx_phase_samples["active"] = finalize_phase_samples(active_tx_samples)
       print(f"Starting exit handoff for up to {args.handoff_seconds:.1f}s.")
       print(
         f"Handoff will end on {args.handoff_end_on} "
@@ -484,6 +511,7 @@ def run(args: argparse.Namespace) -> None:
       tracks_seen = False
       announced_tracks = False
       handoff_samples: dict[int, list[dict[str, object]]] = defaultdict(list)
+      handoff_tx_samples: dict[int, list[dict[str, object]]] = defaultdict(list)
       handoff_start = time.monotonic()
 
       while time.monotonic() < handoff_deadline:
@@ -522,14 +550,27 @@ def run(args: argparse.Namespace) -> None:
         if now >= next_handoff_send:
           if args.replace_events and handoff_phase == 0:
             send_events(panda, args.bus, last_command_set)
+            if sample_addrs:
+              append_sample(handoff_tx_samples, CRZ_EVENTS_ADDR, last_command_set.raw_21f,
+                            phase_start=handoff_start, sample_limit=args.sample_limit, sample_addrs=sample_addrs)
             handoff_phase = 1
             next_handoff_send = now + 0.01
           else:
             send_crz_pair(panda, args.bus, last_command_set)
+            if sample_addrs:
+              append_sample(handoff_tx_samples, CRZ_INFO_ADDR, last_command_set.raw_21b,
+                            phase_start=handoff_start, sample_limit=args.sample_limit, sample_addrs=sample_addrs)
+              append_sample(handoff_tx_samples, CRZ_CTRL_ADDR, last_command_set.raw_21c,
+                            phase_start=handoff_start, sample_limit=args.sample_limit, sample_addrs=sample_addrs)
             handoff_phase = 0
             next_handoff_send = now + (0.02 if not args.replace_events else 0.01)
         if radar_sequence is not None and now >= next_handoff_radar_send:
-          send_radar_snapshot(panda, args.bus, radar_sequence[handoff_radar_sequence_index])
+          current_snapshot = radar_sequence[handoff_radar_sequence_index]
+          send_radar_snapshot(panda, args.bus, current_snapshot)
+          if sample_addrs:
+            for replay_addr, replay_dat in current_snapshot.items():
+              append_sample(handoff_tx_samples, replay_addr, replay_dat,
+                            phase_start=handoff_start, sample_limit=args.sample_limit, sample_addrs=sample_addrs)
           handoff_radar_sequence_index = (handoff_radar_sequence_index + 1) % len(radar_sequence)
           next_handoff_radar_send = now + (1.0 / RADAR_REPLAY_HZ)
         if status_parser is not None and now >= next_handoff_status:
@@ -539,8 +580,10 @@ def run(args: argparse.Namespace) -> None:
         time.sleep(0.001)
       if sample_addrs:
         phase_samples["handoff"] = finalize_phase_samples(handoff_samples)
+        tx_phase_samples["handoff"] = finalize_phase_samples(handoff_tx_samples)
     elif sample_addrs:
       phase_samples["active"] = finalize_phase_samples(active_samples)
+      tx_phase_samples["active"] = finalize_phase_samples(active_tx_samples)
     if args.exit_default_session:
       try:
         print("Requesting radar return to UDS default session.")
@@ -567,6 +610,7 @@ def run(args: argparse.Namespace) -> None:
           for snapshot in (radar_sequence or [])
         ],
         "phases": phase_samples,
+        "tx_phases": tx_phase_samples,
       }
       args.sample_output.write_text(json.dumps(sample_payload, indent=2) + "\n")
       print(f"Wrote phase samples JSON to {args.sample_output}")
