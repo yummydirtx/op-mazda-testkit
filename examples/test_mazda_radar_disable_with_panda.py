@@ -41,6 +41,14 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--session-only", action="store_true", help="Do not send communication-control. Hold the chosen diagnostic session and observe traffic while tester-present is active.")
   parser.add_argument("--exit-default-session", action="store_true",
                       help="After the hold, explicitly request UDS default session on the radar before returning Panda to silent mode")
+  parser.add_argument("--all-addrs", action="store_true",
+                      help="Count every CAN address seen on the selected bus and report dropout candidates, not just the current Mazda shortlist")
+  parser.add_argument("--drop-ratio-threshold", type=float, default=0.5,
+                      help="In --all-addrs mode, report addresses whose active-session rate is at or below this fraction of the baseline rate")
+  parser.add_argument("--min-before-count", type=int, default=3,
+                      help="In --all-addrs mode, require at least this many baseline frames before reporting an address as dropped")
+  parser.add_argument("--max-drop-lines", type=int, default=80,
+                      help="In --all-addrs mode, cap the number of reported dropout addresses")
   parser.add_argument("--allow-aeb-risk", action="store_true", help="Required. Radar disable may remove high-speed AEB.")
   parser.add_argument("--output", type=Path, help="Optional text output file")
   return parser.parse_args()
@@ -56,13 +64,13 @@ def ensure_pandad_stopped() -> None:
       raise
 
 
-def count_addrs(panda: Panda, bus: int, seconds: float) -> Counter[int]:
+def count_addrs(panda: Panda, bus: int, seconds: float, *, all_addrs: bool = False) -> Counter[int]:
   deadline = time.monotonic() + seconds
   counts: Counter[int] = Counter()
   panda.can_clear(0xFFFF)
   while time.monotonic() < deadline:
     for addr, _dat, src in panda.can_recv():
-      if src == bus and addr in TARGET_ADDRS:
+      if src == bus and (all_addrs or addr in TARGET_ADDRS):
         counts[addr] += 1
     time.sleep(0.001)
   return counts
@@ -70,7 +78,9 @@ def count_addrs(panda: Panda, bus: int, seconds: float) -> Counter[int]:
 
 def count_addrs_with_tester_present(panda: Panda, bus: int, addr: int, seconds: float,
                                     tester_present_interval: float = 0.5,
-                                    progress_interval: float = 0.0) -> Counter[int]:
+                                    progress_interval: float = 0.0,
+                                    *,
+                                    all_addrs: bool = False) -> Counter[int]:
   deadline = time.monotonic() + seconds
   next_tester_present = time.monotonic()
   next_progress = time.monotonic() + progress_interval if progress_interval > 0 else float("inf")
@@ -92,17 +102,62 @@ def count_addrs_with_tester_present(panda: Panda, bus: int, addr: int, seconds: 
       next_progress = now + progress_interval
 
     for rx_addr, _dat, src in panda.can_recv():
-      if src == bus and rx_addr in TARGET_ADDRS:
+      if src == bus and (all_addrs or rx_addr in TARGET_ADDRS):
         counts[rx_addr] += 1
     time.sleep(0.001)
   return counts
 
 
-def format_counts(title: str, counts: Counter[int], seconds: float) -> str:
+def format_counts(title: str, counts: Counter[int], seconds: float, *, all_addrs: bool = False) -> str:
   lines = [title]
-  for addr in TARGET_ADDRS:
+  addrs = sorted(counts) if all_addrs else list(TARGET_ADDRS)
+  if all_addrs:
+    lines.append(f"  unique_addrs={len(addrs)}")
+  for addr in addrs:
     hz = counts[addr] / seconds
     lines.append(f"  {hex(addr)} count={counts[addr]} hz={hz:.2f}")
+  return "\n".join(lines)
+
+
+def format_dropout_candidates(title: str,
+                              before_counts: Counter[int],
+                              during_counts: Counter[int],
+                              before_seconds: float,
+                              during_seconds: float,
+                              *,
+                              min_before_count: int,
+                              drop_ratio_threshold: float,
+                              max_lines: int) -> str:
+  rows: list[tuple[float, float, int, int, int]] = []
+  for addr in set(before_counts) | set(during_counts):
+    before = before_counts[addr]
+    during = during_counts[addr]
+    if before < min_before_count:
+      continue
+    before_hz = before / before_seconds
+    during_hz = during / during_seconds
+    ratio = (during_hz / before_hz) if before_hz > 0 else float("inf")
+    if ratio <= drop_ratio_threshold:
+      rows.append((ratio, -before_hz, addr, before, during))
+
+  rows.sort()
+  lines = [
+    title,
+    f"  filters: min_before_count={min_before_count} drop_ratio_threshold={drop_ratio_threshold:.2f} max_lines={max_lines}",
+  ]
+  if not rows:
+    lines.append("  no dropout candidates matched the current filters")
+    return "\n".join(lines)
+
+  for ratio, neg_before_hz, addr, before, during in rows[:max_lines]:
+    before_hz = -neg_before_hz
+    during_hz = during / during_seconds
+    lines.append(
+      f"  {hex(addr)} before={before} ({before_hz:.2f}Hz) "
+      f"during={during} ({during_hz:.2f}Hz) ratio={ratio:.2f}"
+    )
+  if len(rows) > max_lines:
+    lines.append(f"  ... truncated {len(rows) - max_lines} additional addresses")
   return "\n".join(lines)
 
 
@@ -139,8 +194,8 @@ def main() -> None:
   session_entered = False
 
   try:
-    before_counts = count_addrs(panda, args.bus, args.before_seconds)
-    report.append(format_counts("Before disable:", before_counts, args.before_seconds))
+    before_counts = count_addrs(panda, args.bus, args.before_seconds, all_addrs=args.all_addrs)
+    report.append(format_counts("Before disable:", before_counts, args.before_seconds, all_addrs=args.all_addrs))
 
     client = uds.UdsClient(panda, args.addr, bus=args.bus)
     report.append(f"\nUDS session start: addr={hex(args.addr)} bus={args.bus} control_type={control_type.name}")
@@ -171,22 +226,35 @@ def main() -> None:
         observed_counts = count_addrs_with_tester_present(
           panda, args.bus, args.addr, args.during_seconds,
           progress_interval=args.progress_interval,
+          all_addrs=args.all_addrs,
         )
         report.append("")
         title = "During active session:" if args.session_only and not disable_succeeded else "During disable hold:"
-        report.append(format_counts(title, observed_counts, args.during_seconds))
+        report.append(format_counts(title, observed_counts, args.during_seconds, all_addrs=args.all_addrs))
         report.append("\nTarget message deltas:")
         for addr in TARGET_ADDRS:
           before = before_counts[addr]
           during = observed_counts[addr]
           ratio = (during / before) if before else 0.0
           report.append(f"  {hex(addr)} before={before} during={during} ratio={ratio:.2f}")
+        if args.all_addrs:
+          report.append("")
+          report.append(format_dropout_candidates(
+            "All-address dropout candidates:",
+            before_counts,
+            observed_counts,
+            args.before_seconds,
+            args.during_seconds,
+            min_before_count=args.min_before_count,
+            drop_ratio_threshold=args.drop_ratio_threshold,
+            max_lines=args.max_drop_lines,
+          ))
         break
 
     if not (disable_succeeded or args.session_only):
-      after_counts = count_addrs(panda, args.bus, args.before_seconds)
+      after_counts = count_addrs(panda, args.bus, args.before_seconds, all_addrs=args.all_addrs)
       report.append("")
-      report.append(format_counts("After disable:", after_counts, args.before_seconds))
+      report.append(format_counts("After disable:", after_counts, args.before_seconds, all_addrs=args.all_addrs))
 
       report.append("\nTarget message deltas:")
       for addr in TARGET_ADDRS:
@@ -194,6 +262,18 @@ def main() -> None:
         after = after_counts[addr]
         ratio = (after / before) if before else 0.0
         report.append(f"  {hex(addr)} before={before} after={after} ratio={ratio:.2f}")
+      if args.all_addrs:
+        report.append("")
+        report.append(format_dropout_candidates(
+          "All-address dropout candidates:",
+          before_counts,
+          after_counts,
+          args.before_seconds,
+          args.before_seconds,
+          min_before_count=args.min_before_count,
+          drop_ratio_threshold=args.drop_ratio_threshold,
+          max_lines=args.max_drop_lines,
+        ))
 
     if not disable_succeeded and not args.session_only:
       report.append("\nNo tested diagnostic session accepted COMMUNICATION_CONTROL.")
