@@ -31,8 +31,12 @@ def parse_args() -> argparse.Namespace:
                       help="Legacy alias that sets both --before-seconds and --during-seconds to the same value")
   parser.add_argument("--before-seconds", type=float, default=3.0,
                       help="Seconds to count target frames before entering the diagnostic session")
+  parser.add_argument("--settle-seconds", type=float, default=0.0,
+                      help="Optional quiet period after the baseline count and before entering the diagnostic session")
   parser.add_argument("--during-seconds", type=float, default=3.0,
                       help="Seconds to count target frames while holding tester-present active")
+  parser.add_argument("--after-seconds", type=float, default=0.0,
+                      help="Optional post-exit observation window after releasing the radar session")
   parser.add_argument("--progress-interval", type=float, default=0.0,
                       help="Print a progress line every N seconds during the active hold; 0 disables")
   parser.add_argument("--disable-rx-too", action="store_true", help="Use DISABLE_RX_DISABLE_TX (0x28 03 01) instead of ENABLE_RX_DISABLE_TX (0x28 01 01)")
@@ -161,6 +165,15 @@ def format_dropout_candidates(title: str,
   return "\n".join(lines)
 
 
+def append_target_deltas(report: list[str], title: str, before_counts: Counter[int], current_counts: Counter[int]) -> None:
+  report.append(title)
+  for addr in TARGET_ADDRS:
+    before = before_counts[addr]
+    current = current_counts[addr]
+    ratio = (current / before) if before else 0.0
+    report.append(f"  {hex(addr)} before={before} current={current} ratio={ratio:.2f}")
+
+
 def send_tester_present_suppress_response(panda: Panda, bus: int, addr: int) -> None:
   panda.can_send(addr, b"\x02\x3E\x80\x00\x00\x00\x00\x00", bus)
 
@@ -196,10 +209,14 @@ def main() -> None:
   try:
     before_counts = count_addrs(panda, args.bus, args.before_seconds, all_addrs=args.all_addrs)
     report.append(format_counts("Before disable:", before_counts, args.before_seconds, all_addrs=args.all_addrs))
+    if args.settle_seconds > 0:
+      report.append(f"\nSettling for {args.settle_seconds:.1f}s before entering the diagnostic session.")
+      time.sleep(args.settle_seconds)
 
     client = uds.UdsClient(panda, args.addr, bus=args.bus)
     report.append(f"\nUDS session start: addr={hex(args.addr)} bus={args.bus} control_type={control_type.name}")
 
+    observed_counts: Counter[int] | None = None
     for session_name, session_type in session_attempt_order(args.session, args.try_all_sessions):
       report.append(f"Trying session={session_name} ({session_type.name})")
       try:
@@ -231,16 +248,12 @@ def main() -> None:
         report.append("")
         title = "During active session:" if args.session_only and not disable_succeeded else "During disable hold:"
         report.append(format_counts(title, observed_counts, args.during_seconds, all_addrs=args.all_addrs))
-        report.append("\nTarget message deltas:")
-        for addr in TARGET_ADDRS:
-          before = before_counts[addr]
-          during = observed_counts[addr]
-          ratio = (during / before) if before else 0.0
-          report.append(f"  {hex(addr)} before={before} during={during} ratio={ratio:.2f}")
+        report.append("")
+        append_target_deltas(report, "Target message deltas (baseline -> active):", before_counts, observed_counts)
         if args.all_addrs:
           report.append("")
           report.append(format_dropout_candidates(
-            "All-address dropout candidates:",
+            "All-address dropout candidates (baseline -> active):",
             before_counts,
             observed_counts,
             args.before_seconds,
@@ -248,7 +261,7 @@ def main() -> None:
             min_before_count=args.min_before_count,
             drop_ratio_threshold=args.drop_ratio_threshold,
             max_lines=args.max_drop_lines,
-          ))
+        ))
         break
 
     if not (disable_succeeded or args.session_only):
@@ -256,16 +269,12 @@ def main() -> None:
       report.append("")
       report.append(format_counts("After disable:", after_counts, args.before_seconds, all_addrs=args.all_addrs))
 
-      report.append("\nTarget message deltas:")
-      for addr in TARGET_ADDRS:
-        before = before_counts[addr]
-        after = after_counts[addr]
-        ratio = (after / before) if before else 0.0
-        report.append(f"  {hex(addr)} before={before} after={after} ratio={ratio:.2f}")
+      report.append("")
+      append_target_deltas(report, "Target message deltas (baseline -> after):", before_counts, after_counts)
       if args.all_addrs:
         report.append("")
         report.append(format_dropout_candidates(
-          "All-address dropout candidates:",
+          "All-address dropout candidates (baseline -> after):",
           before_counts,
           after_counts,
           args.before_seconds,
@@ -286,6 +295,25 @@ def main() -> None:
         report.append("Radar default-session request accepted.")
       except Exception as e:
         report.append(f"Radar default-session request failed: {e!r}")
+
+    if args.after_seconds > 0:
+      after_exit_counts = count_addrs(panda, args.bus, args.after_seconds, all_addrs=args.all_addrs)
+      report.append("")
+      report.append(format_counts("After exit:", after_exit_counts, args.after_seconds, all_addrs=args.all_addrs))
+      report.append("")
+      append_target_deltas(report, "Target message deltas (baseline -> post-exit):", before_counts, after_exit_counts)
+      if args.all_addrs:
+        report.append("")
+        report.append(format_dropout_candidates(
+          "All-address dropout candidates (baseline -> post-exit):",
+          before_counts,
+          after_exit_counts,
+          args.before_seconds,
+          args.after_seconds,
+          min_before_count=args.min_before_count,
+          drop_ratio_threshold=args.drop_ratio_threshold,
+          max_lines=args.max_drop_lines,
+        ))
 
   finally:
     panda.set_safety_mode(CarParams.SafetyModel.silent)
