@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 from subprocess import CalledProcessError, check_output
 
@@ -14,6 +15,7 @@ from panda import Panda
 
 
 TARGET_ADDRS: tuple[int, ...] = (0x21B, 0x21C, 0x21F, 0x0FD, 0x167, 0x361, 0x362, 0x363, 0x364, 0x365, 0x366)
+DEFAULT_SAMPLE_ADDRS: tuple[int, ...] = TARGET_ADDRS + (0x499,)
 SESSION_BY_NAME: dict[str, uds.SESSION_TYPE] = {
   "default": uds.SESSION_TYPE.DEFAULT,
   "programming": uds.SESSION_TYPE.PROGRAMMING,
@@ -53,6 +55,12 @@ def parse_args() -> argparse.Namespace:
                       help="In --all-addrs mode, require at least this many baseline frames before reporting an address as dropped")
   parser.add_argument("--max-drop-lines", type=int, default=80,
                       help="In --all-addrs mode, cap the number of reported dropout addresses")
+  parser.add_argument("--sample-output", type=Path,
+                      help="Optional JSON artifact path for timestamped raw-frame samples from each phase")
+  parser.add_argument("--sample-addrs", type=str,
+                      help="Comma-separated CAN addresses to sample into --sample-output. Defaults to 0x21b,0x21c,0x21f,0xfd,0x167,0x361-0x366,0x499")
+  parser.add_argument("--sample-limit", type=int, default=40,
+                      help="Maximum sampled frames to retain per address per phase in --sample-output")
   parser.add_argument("--allow-aeb-risk", action="store_true", help="Required. Radar disable may remove high-speed AEB.")
   parser.add_argument("--output", type=Path, help="Optional text output file")
   return parser.parse_args()
@@ -68,27 +76,52 @@ def ensure_pandad_stopped() -> None:
       raise
 
 
-def count_addrs(panda: Panda, bus: int, seconds: float, *, all_addrs: bool = False) -> Counter[int]:
+def parse_addr_csv(value: str | None) -> tuple[int, ...]:
+  if value is None or value.strip() == "":
+    return DEFAULT_SAMPLE_ADDRS
+  return tuple(int(part.strip(), 0) for part in value.split(",") if part.strip())
+
+
+def finalize_phase_samples(samples: dict[int, list[dict[str, object]]]) -> dict[str, list[dict[str, object]]]:
+  return {hex(addr): entries for addr, entries in sorted(samples.items())}
+
+
+def count_addrs(panda: Panda,
+                bus: int,
+                seconds: float,
+                *,
+                all_addrs: bool = False,
+                sample_addrs: set[int] | None = None,
+                sample_limit: int = 0) -> tuple[Counter[int], dict[int, list[dict[str, object]]]]:
   deadline = time.monotonic() + seconds
+  start = time.monotonic()
   counts: Counter[int] = Counter()
+  samples: dict[int, list[dict[str, object]]] = defaultdict(list)
   panda.can_clear(0xFFFF)
   while time.monotonic() < deadline:
-    for addr, _dat, src in panda.can_recv():
+    now = time.monotonic()
+    for addr, dat, src in panda.can_recv():
       if src == bus and (all_addrs or addr in TARGET_ADDRS):
         counts[addr] += 1
+      if src == bus and sample_addrs and addr in sample_addrs and len(samples[addr]) < sample_limit:
+        samples[addr].append({"t": round(now - start, 6), "data": dat.hex()})
     time.sleep(0.001)
-  return counts
+  return counts, samples
 
 
 def count_addrs_with_tester_present(panda: Panda, bus: int, addr: int, seconds: float,
                                     tester_present_interval: float = 0.5,
                                     progress_interval: float = 0.0,
                                     *,
-                                    all_addrs: bool = False) -> Counter[int]:
+                                    all_addrs: bool = False,
+                                    sample_addrs: set[int] | None = None,
+                                    sample_limit: int = 0) -> tuple[Counter[int], dict[int, list[dict[str, object]]]]:
   deadline = time.monotonic() + seconds
+  start = time.monotonic()
   next_tester_present = time.monotonic()
   next_progress = time.monotonic() + progress_interval if progress_interval > 0 else float("inf")
   counts: Counter[int] = Counter()
+  samples: dict[int, list[dict[str, object]]] = defaultdict(list)
   panda.can_clear(0xFFFF)
   while time.monotonic() < deadline:
     now = time.monotonic()
@@ -105,11 +138,13 @@ def count_addrs_with_tester_present(panda: Panda, bus: int, addr: int, seconds: 
       )
       next_progress = now + progress_interval
 
-    for rx_addr, _dat, src in panda.can_recv():
+    for rx_addr, dat, src in panda.can_recv():
       if src == bus and (all_addrs or rx_addr in TARGET_ADDRS):
         counts[rx_addr] += 1
+      if src == bus and sample_addrs and rx_addr in sample_addrs and len(samples[rx_addr]) < sample_limit:
+        samples[rx_addr].append({"t": round(now - start, 6), "data": dat.hex()})
     time.sleep(0.001)
-  return counts
+  return counts, samples
 
 
 def format_counts(title: str, counts: Counter[int], seconds: float, *, all_addrs: bool = False) -> str:
@@ -206,6 +241,7 @@ def main() -> None:
     args.during_seconds = args.observe_seconds
 
   ensure_pandad_stopped()
+  sample_addrs = set(parse_addr_csv(args.sample_addrs)) if args.sample_output is not None else set()
 
   panda = Panda()
   panda.set_can_speed_kbps(args.bus, args.can_speed_kbps)
@@ -215,9 +251,19 @@ def main() -> None:
   report: list[str] = []
   disable_succeeded = False
   session_entered = False
+  phase_samples: dict[str, dict[str, list[dict[str, object]]]] = {}
 
   try:
-    before_counts = count_addrs(panda, args.bus, args.before_seconds, all_addrs=args.all_addrs)
+    before_counts, before_samples = count_addrs(
+      panda,
+      args.bus,
+      args.before_seconds,
+      all_addrs=args.all_addrs,
+      sample_addrs=sample_addrs,
+      sample_limit=args.sample_limit,
+    )
+    if sample_addrs:
+      phase_samples["before"] = finalize_phase_samples(before_samples)
     report.append(format_counts("Before disable:", before_counts, args.before_seconds, all_addrs=args.all_addrs))
     if args.settle_seconds > 0:
       report.append(f"\nSettling for {args.settle_seconds:.1f}s before entering the diagnostic session.")
@@ -250,11 +296,15 @@ def main() -> None:
           report.append(f"  communication_control failed: {e!r}")
 
       if disable_succeeded or args.session_only:
-        observed_counts = count_addrs_with_tester_present(
+        observed_counts, observed_samples = count_addrs_with_tester_present(
           panda, args.bus, args.addr, args.during_seconds,
           progress_interval=args.progress_interval,
           all_addrs=args.all_addrs,
+          sample_addrs=sample_addrs,
+          sample_limit=args.sample_limit,
         )
+        if sample_addrs:
+          phase_samples["active"] = finalize_phase_samples(observed_samples)
         report.append("")
         title = "During active session:" if args.session_only and not disable_succeeded else "During disable hold:"
         report.append(format_counts(title, observed_counts, args.during_seconds, all_addrs=args.all_addrs))
@@ -282,7 +332,16 @@ def main() -> None:
         break
 
     if not (disable_succeeded or args.session_only):
-      after_counts = count_addrs(panda, args.bus, args.before_seconds, all_addrs=args.all_addrs)
+      after_counts, after_samples = count_addrs(
+        panda,
+        args.bus,
+        args.before_seconds,
+        all_addrs=args.all_addrs,
+        sample_addrs=sample_addrs,
+        sample_limit=args.sample_limit,
+      )
+      if sample_addrs:
+        phase_samples["after"] = finalize_phase_samples(after_samples)
       report.append("")
       report.append(format_counts("After disable:", after_counts, args.before_seconds, all_addrs=args.all_addrs))
 
@@ -321,7 +380,16 @@ def main() -> None:
         report.append(f"Radar default-session request failed: {e!r}")
 
     if args.after_seconds > 0:
-      after_exit_counts = count_addrs(panda, args.bus, args.after_seconds, all_addrs=args.all_addrs)
+      after_exit_counts, after_exit_samples = count_addrs(
+        panda,
+        args.bus,
+        args.after_seconds,
+        all_addrs=args.all_addrs,
+        sample_addrs=sample_addrs,
+        sample_limit=args.sample_limit,
+      )
+      if sample_addrs:
+        phase_samples["post_exit"] = finalize_phase_samples(after_exit_samples)
       report.append("")
       report.append(format_counts("After exit:", after_exit_counts, args.after_seconds, all_addrs=args.all_addrs))
       report.append("")
@@ -355,6 +423,22 @@ def main() -> None:
   if args.output is not None:
     args.output.write_text(output + "\n")
     print(f"\nWrote report to {args.output}")
+  if args.sample_output is not None:
+    sample_payload = {
+      "bus": args.bus,
+      "radar_addr": hex(args.addr),
+      "session": args.session,
+      "session_only": args.session_only,
+      "before_seconds": args.before_seconds,
+      "settle_seconds": args.settle_seconds,
+      "during_seconds": args.during_seconds,
+      "after_seconds": args.after_seconds,
+      "sample_limit": args.sample_limit,
+      "sample_addrs": [hex(addr) for addr in sorted(sample_addrs)],
+      "phases": phase_samples,
+    }
+    args.sample_output.write_text(json.dumps(sample_payload, indent=2) + "\n")
+    print(f"Wrote phase samples JSON to {args.sample_output}")
 
 
 if __name__ == "__main__":
