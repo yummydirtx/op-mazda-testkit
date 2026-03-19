@@ -65,6 +65,7 @@ SESSION_BY_NAME: dict[str, uds.SESSION_TYPE] = {
   "safety": uds.SESSION_TYPE.SAFETY_SYSTEM_DIAGNOSTIC,
 }
 RADAR_TRACK_ADDRS: tuple[int, ...] = (0x361, 0x362, 0x363, 0x364, 0x365, 0x366)
+RADAR_REPLAY_ADDRS: tuple[int, ...] = RADAR_TRACK_ADDRS + (0x499,)
 STATUS_MESSAGES: tuple[tuple[str, int], ...] = (
   ("CRZ_CTRL", 50),
   ("CRZ_EVENTS", 50),
@@ -126,7 +127,7 @@ def parse_args() -> argparse.Namespace:
                       help="Condition that ends the exit handoff early instead of waiting the full handoff timeout")
   parser.add_argument("--handoff-stock-pair-count", type=int, default=3,
                       help="How many stock 0x21b and 0x21c frames must be observed during handoff before stock-pair restoration is considered stable")
-  parser.add_argument("--replay-pre-session-radar", action="store_true", help="Capture the current 0x361-0x366 burst before entering programming session and replay it at 10 Hz while the radar is suppressed")
+  parser.add_argument("--replay-pre-session-radar", action="store_true", help="Capture the current 0x361-0x366 + 0x499 radar burst before entering programming session and replay it at 10 Hz while the radar is suppressed")
   parser.add_argument("--replace-events", action="store_true", help="Also send 0x21f CRZ_EVENTS at 50 Hz, 10 ms ahead of 0x21b/0x21c")
   parser.add_argument("--unsafe-patch-events", action="store_true", help="When overriding info_accel_cmd, also approximate-patch 0x21f. CRZ_EVENTS checksum semantics are still unresolved.")
   parser.add_argument("--target-speed-mph", type=float, help="Optional target set speed in mph. Requires --replace-events and --unsafe-patch-events.")
@@ -256,18 +257,18 @@ def capture_radar_burst(panda: Panda, bus: int, timeout_s: float = 1.0) -> dict[
 
   while time.monotonic() < deadline:
     for addr, dat, src in panda.can_recv():
-      if src == bus and addr in RADAR_TRACK_ADDRS:
+      if src == bus and addr in RADAR_REPLAY_ADDRS:
         burst[addr] = bytes(dat)
-    if all(addr in burst for addr in RADAR_TRACK_ADDRS):
+    if all(addr in burst for addr in RADAR_REPLAY_ADDRS):
       return burst
     time.sleep(0.001)
 
-  missing = [hex(addr) for addr in RADAR_TRACK_ADDRS if addr not in burst]
+  missing = [hex(addr) for addr in RADAR_REPLAY_ADDRS if addr not in burst]
   raise RuntimeError(f"Timed out waiting for full radar burst, missing {', '.join(missing)}")
 
 
 def send_radar_burst(panda: Panda, bus: int, burst: dict[int, bytes]) -> None:
-  panda.can_send_many([(addr, burst[addr], bus) for addr in RADAR_TRACK_ADDRS], timeout=0)
+  panda.can_send_many([(addr, burst[addr], bus) for addr in RADAR_REPLAY_ADDRS], timeout=0)
 
 
 def run(args: argparse.Namespace) -> None:

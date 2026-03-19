@@ -165,13 +165,23 @@ def format_dropout_candidates(title: str,
   return "\n".join(lines)
 
 
-def append_target_deltas(report: list[str], title: str, before_counts: Counter[int], current_counts: Counter[int]) -> None:
+def append_target_deltas(report: list[str],
+                         title: str,
+                         before_counts: Counter[int],
+                         current_counts: Counter[int],
+                         before_seconds: float,
+                         current_seconds: float) -> None:
   report.append(title)
   for addr in TARGET_ADDRS:
     before = before_counts[addr]
     current = current_counts[addr]
-    ratio = (current / before) if before else 0.0
-    report.append(f"  {hex(addr)} before={before} current={current} ratio={ratio:.2f}")
+    before_hz = before / before_seconds if before_seconds > 0 else 0.0
+    current_hz = current / current_seconds if current_seconds > 0 else 0.0
+    ratio = (current_hz / before_hz) if before_hz > 0 else 0.0
+    report.append(
+      f"  {hex(addr)} before={before} ({before_hz:.2f}Hz) "
+      f"current={current} ({current_hz:.2f}Hz) ratio={ratio:.2f}"
+    )
 
 
 def send_tester_present_suppress_response(panda: Panda, bus: int, addr: int) -> None:
@@ -249,7 +259,14 @@ def main() -> None:
         title = "During active session:" if args.session_only and not disable_succeeded else "During disable hold:"
         report.append(format_counts(title, observed_counts, args.during_seconds, all_addrs=args.all_addrs))
         report.append("")
-        append_target_deltas(report, "Target message deltas (baseline -> active):", before_counts, observed_counts)
+        append_target_deltas(
+          report,
+          "Target message deltas (baseline -> active):",
+          before_counts,
+          observed_counts,
+          args.before_seconds,
+          args.during_seconds,
+        )
         if args.all_addrs:
           report.append("")
           report.append(format_dropout_candidates(
@@ -270,7 +287,14 @@ def main() -> None:
       report.append(format_counts("After disable:", after_counts, args.before_seconds, all_addrs=args.all_addrs))
 
       report.append("")
-      append_target_deltas(report, "Target message deltas (baseline -> after):", before_counts, after_counts)
+      append_target_deltas(
+        report,
+        "Target message deltas (baseline -> after):",
+        before_counts,
+        after_counts,
+        args.before_seconds,
+        args.before_seconds,
+      )
       if args.all_addrs:
         report.append("")
         report.append(format_dropout_candidates(
@@ -301,7 +325,14 @@ def main() -> None:
       report.append("")
       report.append(format_counts("After exit:", after_exit_counts, args.after_seconds, all_addrs=args.all_addrs))
       report.append("")
-      append_target_deltas(report, "Target message deltas (baseline -> post-exit):", before_counts, after_exit_counts)
+      append_target_deltas(
+        report,
+        "Target message deltas (baseline -> post-exit):",
+        before_counts,
+        after_exit_counts,
+        args.before_seconds,
+        args.after_seconds,
+      )
       if args.all_addrs:
         report.append("")
         report.append(format_dropout_candidates(
