@@ -66,6 +66,7 @@ SESSION_BY_NAME: dict[str, uds.SESSION_TYPE] = {
 }
 RADAR_TRACK_ADDRS: tuple[int, ...] = (0x361, 0x362, 0x363, 0x364, 0x365, 0x366)
 RADAR_REPLAY_ADDRS: tuple[int, ...] = RADAR_TRACK_ADDRS + (0x499,)
+RADAR_REPLAY_HZ = 10.0
 STATUS_MESSAGES: tuple[tuple[str, int], ...] = (
   ("CRZ_CTRL", 50),
   ("CRZ_EVENTS", 50),
@@ -127,7 +128,9 @@ def parse_args() -> argparse.Namespace:
                       help="Condition that ends the exit handoff early instead of waiting the full handoff timeout")
   parser.add_argument("--handoff-stock-pair-count", type=int, default=3,
                       help="How many stock 0x21b and 0x21c frames must be observed during handoff before stock-pair restoration is considered stable")
-  parser.add_argument("--replay-pre-session-radar", action="store_true", help="Capture the current 0x361-0x366 + 0x499 radar burst before entering programming session and replay it at 10 Hz while the radar is suppressed")
+  parser.add_argument("--replay-pre-session-radar", action="store_true", help="Capture the current 0x361-0x366 + 0x499 radar sequence before entering programming session and replay it at 10 Hz while the radar is suppressed")
+  parser.add_argument("--radar-replay-capture-seconds", type=float, default=1.0,
+                      help="How much pre-session radar traffic to capture for --replay-pre-session-radar")
   parser.add_argument("--replace-events", action="store_true", help="Also send 0x21f CRZ_EVENTS at 50 Hz, 10 ms ahead of 0x21b/0x21c")
   parser.add_argument("--unsafe-patch-events", action="store_true", help="When overriding info_accel_cmd, also approximate-patch 0x21f. CRZ_EVENTS checksum semantics are still unresolved.")
   parser.add_argument("--target-speed-mph", type=float, help="Optional target set speed in mph. Requires --replace-events and --unsafe-patch-events.")
@@ -250,25 +253,29 @@ def print_tx_status(prefix: str, command_set) -> None:
   )
 
 
-def capture_radar_burst(panda: Panda, bus: int, timeout_s: float = 1.0) -> dict[int, bytes]:
-  deadline = time.monotonic() + timeout_s
+def capture_radar_sequence(panda: Panda, bus: int, capture_seconds: float = 1.0) -> list[dict[int, bytes]]:
+  deadline = time.monotonic() + capture_seconds
   burst: dict[int, bytes] = {}
+  sequence: list[dict[int, bytes]] = []
   panda.can_clear(0xFFFF)
 
   while time.monotonic() < deadline:
     for addr, dat, src in panda.can_recv():
       if src == bus and addr in RADAR_REPLAY_ADDRS:
         burst[addr] = bytes(dat)
-    if all(addr in burst for addr in RADAR_REPLAY_ADDRS):
-      return burst
+        if all(required_addr in burst for required_addr in RADAR_REPLAY_ADDRS):
+          sequence.append(dict(burst))
+          burst = {}
     time.sleep(0.001)
 
+  if sequence:
+    return sequence
   missing = [hex(addr) for addr in RADAR_REPLAY_ADDRS if addr not in burst]
-  raise RuntimeError(f"Timed out waiting for full radar burst, missing {', '.join(missing)}")
+  raise RuntimeError(f"Timed out waiting for radar replay sequence, missing {', '.join(missing)}")
 
 
-def send_radar_burst(panda: Panda, bus: int, burst: dict[int, bytes]) -> None:
-  panda.can_send_many([(addr, burst[addr], bus) for addr in RADAR_REPLAY_ADDRS], timeout=0)
+def send_radar_snapshot(panda: Panda, bus: int, snapshot: dict[int, bytes]) -> None:
+  panda.can_send_many([(addr, snapshot[addr], bus) for addr in RADAR_REPLAY_ADDRS], timeout=0)
 
 
 def run(args: argparse.Namespace) -> None:
@@ -303,11 +310,12 @@ def run(args: argparse.Namespace) -> None:
   status_parser = CANParser("mazda_2017", list(STATUS_MESSAGES), args.bus) if args.status_interval > 0 else None
   rx_counts: Counter[int] = Counter()
 
-  radar_burst: dict[int, bytes] | None = None
+  radar_sequence: list[dict[int, bytes]] | None = None
   if args.replay_pre_session_radar:
-    print("Capturing pre-session radar burst from current vehicle state.")
-    radar_burst = capture_radar_burst(panda, args.bus)
-    print("Captured radar burst:", " ".join(f"{hex(addr)}={dat.hex()}" for addr, dat in radar_burst.items()))
+    print("Capturing pre-session radar sequence from current vehicle state.")
+    radar_sequence = capture_radar_sequence(panda, args.bus, args.radar_replay_capture_seconds)
+    print(f"Captured {len(radar_sequence)} radar snapshots for replay.")
+    print("First radar snapshot:", " ".join(f"{hex(addr)}={dat.hex()}" for addr, dat in radar_sequence[0].items()))
 
   print(f"Entering radar session: addr={hex(args.radar_addr)} session={args.session}")
   client = uds.UdsClient(panda, args.radar_addr, bus=args.bus)
@@ -318,6 +326,7 @@ def run(args: argparse.Namespace) -> None:
   next_send = start_time
   next_tester_present = start_time + args.tester_present_interval
   next_radar_send = start_time
+  radar_sequence_index = 0
   next_status = start_time + args.status_interval if args.status_interval > 0 else float("inf")
   engage_start = start_time + args.engage_delay
   engage_button = BUTTON_BY_NAME[args.engage_button]
@@ -343,8 +352,8 @@ def run(args: argparse.Namespace) -> None:
       f"Will send {args.engage_button} cruise button pulse(s) after {args.engage_delay:.2f}s: "
       f"{args.engage_repeat} press(es), {args.engage_press_seconds:.2f}s each, {args.engage_repeat_interval:.2f}s apart."
     )
-  if radar_burst is not None:
-    print("Replaying the pre-session parked radar burst at 10 Hz.")
+  if radar_sequence is not None:
+    print(f"Replaying the pre-session radar sequence at {RADAR_REPLAY_HZ:.0f} Hz.")
   print("Press Ctrl-C to stop.")
 
   try:
@@ -356,9 +365,10 @@ def run(args: argparse.Namespace) -> None:
       if now >= next_tester_present:
         send_tester_present_suppress_response(panda, args.bus, args.radar_addr)
         next_tester_present = now + args.tester_present_interval
-      if radar_burst is not None and now >= next_radar_send:
-        send_radar_burst(panda, args.bus, radar_burst)
-        next_radar_send = now + 0.1
+      if radar_sequence is not None and now >= next_radar_send:
+        send_radar_snapshot(panda, args.bus, radar_sequence[radar_sequence_index])
+        radar_sequence_index = (radar_sequence_index + 1) % len(radar_sequence)
+        next_radar_send = now + (1.0 / RADAR_REPLAY_HZ)
       if engage_button != Buttons.NONE and engage_counter < args.engage_repeat:
         if now >= next_press_start and press_end == 0.0:
           press_end = now + args.engage_press_seconds
@@ -415,6 +425,7 @@ def run(args: argparse.Namespace) -> None:
       handoff_deadline = time.monotonic() + args.handoff_seconds
       next_handoff_send = time.monotonic()
       next_handoff_radar_send = time.monotonic()
+      handoff_radar_sequence_index = radar_sequence_index
       next_handoff_status = time.monotonic() + args.status_interval if args.status_interval > 0 else float("inf")
       last_command_set = mutator.next_command_set(
         profile=stream.profile,
@@ -460,9 +471,10 @@ def run(args: argparse.Namespace) -> None:
             send_crz_pair(panda, args.bus, last_command_set)
             handoff_phase = 0
             next_handoff_send = now + (0.02 if not args.replace_events else 0.01)
-        if radar_burst is not None and now >= next_handoff_radar_send:
-          send_radar_burst(panda, args.bus, radar_burst)
-          next_handoff_radar_send = now + 0.1
+        if radar_sequence is not None and now >= next_handoff_radar_send:
+          send_radar_snapshot(panda, args.bus, radar_sequence[handoff_radar_sequence_index])
+          handoff_radar_sequence_index = (handoff_radar_sequence_index + 1) % len(radar_sequence)
+          next_handoff_radar_send = now + (1.0 / RADAR_REPLAY_HZ)
         if status_parser is not None and now >= next_handoff_status:
           print_status(f"handoff+{args.handoff_seconds - (handoff_deadline - now):.1f}s", status_parser, rx_counts)
           print_tx_status(f"handoff+{args.handoff_seconds - (handoff_deadline - now):.1f}s", last_command_set)
