@@ -30,6 +30,19 @@ def _frame(delay_s: float, address: int, data_hex: str) -> TimedFrame:
 # These are intentionally split into small presets so they can be tested
 # independently on-car.
 PRESETS: dict[str, list[TimedFrame]] = {
+  "hold-on-shorthold-edge": [
+    _frame(0.000, 0x43D, "001028a764c400e0"),
+    _frame(0.010, 0x9D, "0001ffc000000000"),
+    _frame(0.020, 0x4FE, "000474ffaaff002f"),
+    _frame(0.100, 0x482, "0066000000000000"),
+    _frame(0.110, 0x9D, "0001ffc400000000"),
+    _frame(0.161, 0x4F2, "2024ca2001010000"),
+    _frame(0.200, 0x43D, "0010282774c400e0"),
+    _frame(0.210, 0x9D, "0001ffc800000000"),
+    _frame(0.220, 0x440, "4361000000000060"),
+    _frame(0.310, 0x9D, "0001ffcc00000000"),
+    _frame(0.320, 0x4FE, "00050000006300d1"),
+  ],
   "hold-on-9a": [
     _frame(0.000, 0x9A, "0008000088000300"),
   ],
@@ -87,6 +100,13 @@ PRESETS: dict[str, list[TimedFrame]] = {
   "hold-off-9a": [
     _frame(0.000, 0x9A, "000800c088000300"),
     _frame(0.020, 0x9A, "00c800c088000300"),
+  ],
+  "hold-off-shorthold-edge": [
+    _frame(0.000, 0x43D, "0010282774c400e0"),
+    _frame(0.050, 0x9D, "0001fff000000000"),
+    _frame(0.150, 0x3D1, "0000000007fffa19"),
+    _frame(0.170, 0x43E, "0004fb20c0402820"),
+    _frame(0.240, 0x43E, "0006f960c0402820"),
   ],
   "hold-off-9b-seq": [
     _frame(0.000, 0x9B, "2000140000000000"),
