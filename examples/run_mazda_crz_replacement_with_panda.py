@@ -9,6 +9,7 @@ import sys
 import time
 import traceback
 from collections import Counter, defaultdict
+from dataclasses import replace
 from pathlib import Path
 from subprocess import CalledProcessError, check_output
 from types import SimpleNamespace
@@ -98,6 +99,11 @@ STANDSTILL_PEDALS_SEQUENCE: tuple[bytes, ...] = (
   bytes.fromhex("97001455e0001216"),
 )
 STANDSTILL_PEDALS_LATCH_FRAME = bytes.fromhex("40801775e0000de1")
+CRZ_CTRL_MODE_BYTE_INDEXES: tuple[int, ...] = (0, 2, 3, 6)
+STOCK_STOPGO_CTRL_STOPPING = bytes.fromhex("0a018b6000001000")
+STOCK_STOPGO_CTRL_HOLD_ENTRY = bytes.fromhex("0a018b8000001000")
+STOCK_STOPGO_CTRL_HOLD_LATCHED = bytes.fromhex("0a018b8000000000")
+STOCK_STOPGO_CTRL_RELEASE = bytes.fromhex("0a018b4000001000")
 
 
 class TeeStream:
@@ -168,6 +174,20 @@ def parse_args() -> argparse.Namespace:
                       help="Trigger --inject-standstill-pedals once live ENGINE_DATA speed falls at or below this kph threshold.")
   parser.add_argument("--standstill-repeat", type=int, default=5,
                       help="How many times to replay the stock 0x165 standstill sequence after it triggers.")
+  parser.add_argument("--stock-stopgo-21c", action="store_true",
+                      help="Override 0x21c with a stock-like stop/HOLD state machine based on live speed, STANDSTILL, and resume/gas release.")
+  parser.add_argument("--stock-stopgo-stopping-kph", type=float, default=3.0,
+                      help="Below this speed, negative accel_cmd enters the stock stop approach 0x21c state.")
+  parser.add_argument("--stock-stopgo-hold-entry-kph", type=float, default=0.35,
+                      help="Below this speed, negative accel_cmd enters the stock HOLD-entry 0x21c state.")
+  parser.add_argument("--stock-stopgo-holding-kph", type=float, default=0.05,
+                      help="At or below this speed with STANDSTILL=1, enter the latched stock HOLD 0x21c state.")
+  parser.add_argument("--stock-stopgo-hold-entry-accel-cmd", type=float, default=-700.0,
+                      help="Minimum 0x21b ACCEL_CMD required to arm the HOLD-entry 0x21c state.")
+  parser.add_argument("--stock-stopgo-release-seconds", type=float, default=0.75,
+                      help="How long to hold the stock release 0x21c state after RES or gas is detected while latched.")
+  parser.add_argument("--stock-stopgo-release-gas-threshold", type=float, default=1.0,
+                      help="Treat gas above this percent as a HOLD release request in --stock-stopgo-21c mode.")
   parser.add_argument("--log-file", type=Path, default=default_log_path(), help="Local file to append runner output to so logs survive SSH disconnects")
   parser.add_argument("--sample-output", type=Path,
                       help="Optional JSON artifact path for timestamped raw-frame samples from active and handoff phases")
@@ -250,6 +270,51 @@ def send_button_press(panda: Panda, bus: int, packer: CANPacker, counter: int, b
 
 def send_pedals_frame(panda: Panda, bus: int, dat: bytes) -> None:
   panda.can_send(0x165, dat, bus)
+
+
+def overlay_raw_21c_mode(raw: bytes, template: bytes) -> bytes:
+  dat = bytearray(raw)
+  for index in CRZ_CTRL_MODE_BYTE_INDEXES:
+    dat[index] = template[index]
+  return bytes(dat)
+
+
+def apply_stock_stopgo_21c(command_set,
+                           parser: CANParser | None,
+                           args: argparse.Namespace,
+                           now: float,
+                           hold_latched: bool,
+                           release_until: float) -> tuple[object, bool, float]:
+  if parser is None:
+    return command_set, hold_latched, release_until
+
+  speed_kph = parser.vl["ENGINE_DATA"]["SPEED"]
+  standstill = int(parser.vl["PEDALS"]["STANDSTILL"]) == 1
+  gas = parser.vl["ENGINE_DATA"]["PEDAL_GAS"]
+  resume_pressed = int(parser.vl["CRZ_BTNS"]["RES"]) == 1
+  accel_cmd = decode_signal("CRZ_INFO", command_set.raw_21b, "ACCEL_CMD")
+
+  if hold_latched and (resume_pressed or gas > args.stock_stopgo_release_gas_threshold or speed_kph > args.stock_stopgo_holding_kph):
+    hold_latched = False
+    release_until = now + args.stock_stopgo_release_seconds
+  elif standstill and speed_kph <= args.stock_stopgo_holding_kph:
+    hold_latched = True
+    release_until = 0.0
+
+  if hold_latched:
+    raw_21c = overlay_raw_21c_mode(command_set.raw_21c, STOCK_STOPGO_CTRL_HOLD_LATCHED)
+  elif release_until > now:
+    raw_21c = overlay_raw_21c_mode(command_set.raw_21c, STOCK_STOPGO_CTRL_RELEASE)
+  elif speed_kph <= args.stock_stopgo_hold_entry_kph and accel_cmd <= args.stock_stopgo_hold_entry_accel_cmd:
+    raw_21c = overlay_raw_21c_mode(command_set.raw_21c, STOCK_STOPGO_CTRL_HOLD_ENTRY)
+  elif speed_kph <= args.stock_stopgo_stopping_kph and accel_cmd < 0:
+    raw_21c = overlay_raw_21c_mode(command_set.raw_21c, STOCK_STOPGO_CTRL_STOPPING)
+  else:
+    raw_21c = command_set.raw_21c
+    if speed_kph > args.stock_stopgo_stopping_kph:
+      release_until = 0.0
+
+  return replace(command_set, raw_21c=raw_21c), hold_latched, release_until
 
 
 def drain_can(panda: Panda,
@@ -382,7 +447,7 @@ def run(args: argparse.Namespace) -> None:
   panda = Panda()
   panda.set_can_speed_kbps(args.bus, args.can_speed_kbps)
   panda.set_safety_mode(CarParams.SafetyModel.allOutput)
-  status_parser = CANParser("mazda_2017", list(STATUS_MESSAGES), args.bus) if (args.status_interval > 0 or args.inject_standstill_pedals or args.inject_standstill_pedals_latch) else None
+  status_parser = CANParser("mazda_2017", list(STATUS_MESSAGES), args.bus) if (args.status_interval > 0 or args.inject_standstill_pedals or args.inject_standstill_pedals_latch or args.stock_stopgo_21c) else None
   rx_counts: Counter[int] = Counter()
   phase_samples: dict[str, dict[str, list[dict[str, object]]]] = {}
   tx_phase_samples: dict[str, dict[str, list[dict[str, object]]]] = {}
@@ -431,6 +496,13 @@ def run(args: argparse.Namespace) -> None:
     )
   if radar_sequence is not None:
     print(f"Replaying the pre-session radar sequence at {RADAR_REPLAY_HZ:.0f} Hz.")
+  if args.stock_stopgo_21c:
+    print(
+      "Stock stop/HOLD 0x21c state machine enabled: "
+      f"stopping<={args.stock_stopgo_stopping_kph:.2f}kph, "
+      f"hold-entry<={args.stock_stopgo_hold_entry_kph:.2f}kph, "
+      f"latched-hold<={args.stock_stopgo_holding_kph:.2f}kph."
+    )
   print("Press Ctrl-C to stop.")
   standstill_sequence_armed = args.inject_standstill_pedals
   standstill_sequence_started = False
@@ -438,6 +510,8 @@ def run(args: argparse.Namespace) -> None:
   standstill_repeat_count = 0
   next_standstill_send = start_time
   standstill_latch_active = False
+  stock_stopgo_hold_latched = False
+  stock_stopgo_release_until = 0.0
 
   try:
     phase = 0
@@ -524,6 +598,15 @@ def run(args: argparse.Namespace) -> None:
           crz_speed_kph=target_speed_kph,
           unsafe_patch_events=args.unsafe_patch_events,
         )
+        if args.stock_stopgo_21c:
+          last_command_set, stock_stopgo_hold_latched, stock_stopgo_release_until = apply_stock_stopgo_21c(
+            last_command_set,
+            status_parser,
+            args,
+            now,
+            stock_stopgo_hold_latched,
+            stock_stopgo_release_until,
+          )
         send_events(panda, args.bus, last_command_set)
         if sample_addrs:
           append_sample(active_tx_samples, CRZ_EVENTS_ADDR, last_command_set.raw_21f,
@@ -538,8 +621,26 @@ def run(args: argparse.Namespace) -> None:
             crz_speed_kph=target_speed_kph,
             unsafe_patch_events=False,
           )
+          if args.stock_stopgo_21c:
+            last_command_set, stock_stopgo_hold_latched, stock_stopgo_release_until = apply_stock_stopgo_21c(
+              last_command_set,
+              status_parser,
+              args,
+              now,
+              stock_stopgo_hold_latched,
+              stock_stopgo_release_until,
+            )
         if last_command_set is None:
           raise RuntimeError("No command set available for CRZ pair send")
+        elif args.replace_events and args.stock_stopgo_21c:
+          last_command_set, stock_stopgo_hold_latched, stock_stopgo_release_until = apply_stock_stopgo_21c(
+            last_command_set,
+            status_parser,
+            args,
+            now,
+            stock_stopgo_hold_latched,
+            stock_stopgo_release_until,
+          )
         send_crz_pair(panda, args.bus, last_command_set)
         if sample_addrs:
           append_sample(active_tx_samples, CRZ_INFO_ADDR, last_command_set.raw_21b,
@@ -580,6 +681,15 @@ def run(args: argparse.Namespace) -> None:
         crz_speed_kph=target_speed_kph,
         unsafe_patch_events=args.unsafe_patch_events if args.replace_events else False,
       )
+      if args.stock_stopgo_21c:
+        last_command_set, stock_stopgo_hold_latched, stock_stopgo_release_until = apply_stock_stopgo_21c(
+          last_command_set,
+          status_parser,
+          args,
+          time.monotonic(),
+          stock_stopgo_hold_latched,
+          stock_stopgo_release_until,
+        )
       handoff_phase = 0
       stock_pair_counts: Counter[int] = Counter()
       tracks_seen = False
@@ -630,6 +740,15 @@ def run(args: argparse.Namespace) -> None:
             handoff_phase = 1
             next_handoff_send = now + 0.01
           else:
+            if args.stock_stopgo_21c:
+              last_command_set, stock_stopgo_hold_latched, stock_stopgo_release_until = apply_stock_stopgo_21c(
+                last_command_set,
+                status_parser,
+                args,
+                now,
+                stock_stopgo_hold_latched,
+                stock_stopgo_release_until,
+              )
             send_crz_pair(panda, args.bus, last_command_set)
             if sample_addrs:
               append_sample(handoff_tx_samples, CRZ_INFO_ADDR, last_command_set.raw_21b,
