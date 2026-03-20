@@ -97,6 +97,7 @@ STANDSTILL_PEDALS_SEQUENCE: tuple[bytes, ...] = (
   bytes.fromhex("97001455e000126b"),
   bytes.fromhex("97001455e0001216"),
 )
+STANDSTILL_PEDALS_LATCH_FRAME = bytes.fromhex("40801775e0000de1")
 
 
 class TeeStream:
@@ -161,6 +162,8 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--status-interval", type=float, default=0.5, help="Print decoded Mazda CAN status every N seconds. Set 0 to disable.")
   parser.add_argument("--inject-standstill-pedals", action="store_true",
                       help="When speed reaches a full stop, replay a real stock 0x165 PEDALS standstill sequence.")
+  parser.add_argument("--inject-standstill-pedals-latch", action="store_true",
+                      help="After the standstill sequence, keep sending a latched stock 0x165 STANDSTILL=1/BRAKE_ON=0 frame while stopped.")
   parser.add_argument("--standstill-trigger-kph", type=float, default=0.05,
                       help="Trigger --inject-standstill-pedals once live ENGINE_DATA speed falls at or below this kph threshold.")
   parser.add_argument("--standstill-repeat", type=int, default=5,
@@ -379,7 +382,7 @@ def run(args: argparse.Namespace) -> None:
   panda = Panda()
   panda.set_can_speed_kbps(args.bus, args.can_speed_kbps)
   panda.set_safety_mode(CarParams.SafetyModel.allOutput)
-  status_parser = CANParser("mazda_2017", list(STATUS_MESSAGES), args.bus) if (args.status_interval > 0 or args.inject_standstill_pedals) else None
+  status_parser = CANParser("mazda_2017", list(STATUS_MESSAGES), args.bus) if (args.status_interval > 0 or args.inject_standstill_pedals or args.inject_standstill_pedals_latch) else None
   rx_counts: Counter[int] = Counter()
   phase_samples: dict[str, dict[str, list[dict[str, object]]]] = {}
   tx_phase_samples: dict[str, dict[str, list[dict[str, object]]]] = {}
@@ -434,6 +437,7 @@ def run(args: argparse.Namespace) -> None:
   standstill_sequence_index = 0
   standstill_repeat_count = 0
   next_standstill_send = start_time
+  standstill_latch_active = False
 
   try:
     phase = 0
@@ -475,7 +479,21 @@ def run(args: argparse.Namespace) -> None:
           if standstill_repeat_count >= args.standstill_repeat:
             standstill_sequence_started = False
             standstill_sequence_armed = False
-            print("Completed standstill PEDALS injection sequence.")
+            standstill_latch_active = args.inject_standstill_pedals_latch
+            if standstill_latch_active:
+              print("Completed standstill PEDALS injection sequence; entering latched STANDSTILL replay.")
+            else:
+              print("Completed standstill PEDALS injection sequence.")
+      elif standstill_latch_active and now >= next_standstill_send:
+        if status_parser is not None and status_parser.vl["ENGINE_DATA"]["SPEED"] > args.standstill_trigger_kph:
+          standstill_latch_active = False
+          print("Stopping latched STANDSTILL replay because vehicle speed rose above the trigger threshold.")
+        else:
+          send_pedals_frame(panda, args.bus, STANDSTILL_PEDALS_LATCH_FRAME)
+          if sample_addrs:
+            append_sample(active_tx_samples, 0x165, STANDSTILL_PEDALS_LATCH_FRAME,
+                          phase_start=start_time, sample_limit=args.sample_limit, sample_addrs=sample_addrs)
+          next_standstill_send = now + 0.02
       if now >= next_tester_present:
         send_tester_present_suppress_response(panda, args.bus, args.radar_addr)
         next_tester_present = now + args.tester_present_interval
