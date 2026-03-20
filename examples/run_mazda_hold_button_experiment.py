@@ -33,6 +33,11 @@ PRESETS: dict[str, list[TimedFrame]] = {
   "hold-on-9a": [
     _frame(0.000, 0x9A, "0008000088000300"),
   ],
+  "hold-on-9b-seq": [
+    _frame(0.000, 0x9B, "2200000000000000"),
+    _frame(1.550, 0x9B, "0200000000000000"),
+    _frame(3.400, 0x9B, "0200140000000000"),
+  ],
   "hold-on-50": [
     _frame(0.000, 0x50, "03000f02aa55aaf9"),
     _frame(0.020, 0x50, "02000f02aa55aafb"),
@@ -82,6 +87,10 @@ PRESETS: dict[str, list[TimedFrame]] = {
   "hold-off-9a": [
     _frame(0.000, 0x9A, "000800c088000300"),
     _frame(0.020, 0x9A, "00c800c088000300"),
+  ],
+  "hold-off-9b-seq": [
+    _frame(0.000, 0x9B, "2000140000000000"),
+    _frame(0.080, 0x9B, "2000000000000000"),
   ],
   "hold-off-9b": [
     _frame(0.000, 0x9B, "2000140000000000"),
