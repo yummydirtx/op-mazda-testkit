@@ -83,6 +83,20 @@ BUTTON_BY_NAME: dict[str, int] = {
   "resume": Buttons.RESUME,
   "cancel": Buttons.CANCEL,
 }
+STANDSTILL_PEDALS_SEQUENCE: tuple[bytes, ...] = (
+  bytes.fromhex("97001455e000145c"),
+  bytes.fromhex("97001455e0001352"),
+  bytes.fromhex("97001455e00013c3"),
+  bytes.fromhex("97001455e000144e"),
+  bytes.fromhex("97001455e0001372"),
+  bytes.fromhex("97001455e0001340"),
+  bytes.fromhex("97001455e00012f5"),
+  bytes.fromhex("97001455e00012d9"),
+  bytes.fromhex("97001455e00012d9"),
+  bytes.fromhex("97001455e00012ab"),
+  bytes.fromhex("97001455e000126b"),
+  bytes.fromhex("97001455e0001216"),
+)
 
 
 class TeeStream:
@@ -145,6 +159,12 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--engage-repeat", type=int, default=1, help="How many engage button presses to send")
   parser.add_argument("--engage-repeat-interval", type=float, default=0.75, help="Seconds between repeated engage button presses")
   parser.add_argument("--status-interval", type=float, default=0.5, help="Print decoded Mazda CAN status every N seconds. Set 0 to disable.")
+  parser.add_argument("--inject-standstill-pedals", action="store_true",
+                      help="When speed reaches a full stop, replay a real stock 0x165 PEDALS standstill sequence.")
+  parser.add_argument("--standstill-trigger-kph", type=float, default=0.05,
+                      help="Trigger --inject-standstill-pedals once live ENGINE_DATA speed falls at or below this kph threshold.")
+  parser.add_argument("--standstill-repeat", type=int, default=5,
+                      help="How many times to replay the stock 0x165 standstill sequence after it triggers.")
   parser.add_argument("--log-file", type=Path, default=default_log_path(), help="Local file to append runner output to so logs survive SSH disconnects")
   parser.add_argument("--sample-output", type=Path,
                       help="Optional JSON artifact path for timestamped raw-frame samples from active and handoff phases")
@@ -223,6 +243,10 @@ def send_button_press(panda: Panda, bus: int, packer: CANPacker, counter: int, b
   if msg_bus != bus:
     msg_bus = bus
   panda.can_send(addr, dat, msg_bus)
+
+
+def send_pedals_frame(panda: Panda, bus: int, dat: bytes) -> None:
+  panda.can_send(0x165, dat, bus)
 
 
 def drain_can(panda: Panda,
@@ -341,6 +365,9 @@ def run(args: argparse.Namespace) -> None:
   if args.handoff_stock_pair_count <= 0:
     print("--handoff-stock-pair-count must be > 0.")
     sys.exit(1)
+  if args.standstill_repeat < 1:
+    print("--standstill-repeat must be >= 1.")
+    sys.exit(1)
 
   ensure_pandad_stopped()
   stream = load_stream(args.stream_json, args.profile)
@@ -352,7 +379,7 @@ def run(args: argparse.Namespace) -> None:
   panda = Panda()
   panda.set_can_speed_kbps(args.bus, args.can_speed_kbps)
   panda.set_safety_mode(CarParams.SafetyModel.allOutput)
-  status_parser = CANParser("mazda_2017", list(STATUS_MESSAGES), args.bus) if args.status_interval > 0 else None
+  status_parser = CANParser("mazda_2017", list(STATUS_MESSAGES), args.bus) if (args.status_interval > 0 or args.inject_standstill_pedals) else None
   rx_counts: Counter[int] = Counter()
   phase_samples: dict[str, dict[str, list[dict[str, object]]]] = {}
   tx_phase_samples: dict[str, dict[str, list[dict[str, object]]]] = {}
@@ -402,6 +429,11 @@ def run(args: argparse.Namespace) -> None:
   if radar_sequence is not None:
     print(f"Replaying the pre-session radar sequence at {RADAR_REPLAY_HZ:.0f} Hz.")
   print("Press Ctrl-C to stop.")
+  standstill_sequence_armed = args.inject_standstill_pedals
+  standstill_sequence_started = False
+  standstill_sequence_index = 0
+  standstill_repeat_count = 0
+  next_standstill_send = start_time
 
   try:
     phase = 0
@@ -420,6 +452,30 @@ def run(args: argparse.Namespace) -> None:
         samples=active_samples,
         phase_start=start_time,
       )
+      if standstill_sequence_armed and status_parser is not None and not standstill_sequence_started:
+        if status_parser.vl["ENGINE_DATA"]["SPEED"] <= args.standstill_trigger_kph:
+          standstill_sequence_started = True
+          standstill_sequence_index = 0
+          standstill_repeat_count = 0
+          next_standstill_send = now
+          print(
+            f"Starting standstill PEDALS injection: speed={status_parser.vl['ENGINE_DATA']['SPEED']:.2f} kph "
+            f"repeat={args.standstill_repeat}."
+          )
+      if standstill_sequence_started and now >= next_standstill_send:
+        send_pedals_frame(panda, args.bus, STANDSTILL_PEDALS_SEQUENCE[standstill_sequence_index])
+        if sample_addrs:
+          append_sample(active_tx_samples, 0x165, STANDSTILL_PEDALS_SEQUENCE[standstill_sequence_index],
+                        phase_start=start_time, sample_limit=args.sample_limit, sample_addrs=sample_addrs)
+        standstill_sequence_index += 1
+        next_standstill_send = now + 0.01
+        if standstill_sequence_index >= len(STANDSTILL_PEDALS_SEQUENCE):
+          standstill_sequence_index = 0
+          standstill_repeat_count += 1
+          if standstill_repeat_count >= args.standstill_repeat:
+            standstill_sequence_started = False
+            standstill_sequence_armed = False
+            print("Completed standstill PEDALS injection sequence.")
       if now >= next_tester_present:
         send_tester_present_suppress_response(panda, args.bus, args.radar_addr)
         next_tester_present = now + args.tester_present_interval
