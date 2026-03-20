@@ -30,15 +30,26 @@ def _frame(delay_s: float, address: int, data_hex: str) -> TimedFrame:
 # These are intentionally split into small presets so they can be tested
 # independently on-car.
 PRESETS: dict[str, list[TimedFrame]] = {
+  "hold-on-9a": [
+    _frame(0.000, 0x9A, "0008000088000300"),
+  ],
   "hold-on-50": [
     _frame(0.000, 0x50, "03000f02aa55aaf9"),
     _frame(0.020, 0x50, "02000f02aa55aafb"),
+  ],
+  "hold-on-436": [
+    _frame(0.000, 0x436, "0000190000000001"),
   ],
   "hold-on-274": [
     _frame(0.000, 0x274, "8001004002040200"),
   ],
   "hold-on-9b": [
-    _frame(0.000, 0x9B, "2200000000000000"),
+    _frame(0.000, 0x9B, "2000000000000000"),
+  ],
+  "hold-on-state-all": [
+    _frame(0.000, 0x9A, "0008000088000300"),
+    _frame(0.000, 0x9B, "2000000000000000"),
+    _frame(0.000, 0x436, "0000190000000001"),
   ],
   "hold-on-50-274": [
     _frame(0.000, 0x50, "03000f02aa55aaf9"),
