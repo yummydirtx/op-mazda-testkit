@@ -30,6 +30,20 @@ def _frame(delay_s: float, address: int, data_hex: str) -> TimedFrame:
 # These are intentionally split into small presets so they can be tested
 # independently on-car.
 PRESETS: dict[str, list[TimedFrame]] = {
+  "standstill-on-pedals": [
+    _frame(0.000, 0x165, "97001455e000145c"),
+    _frame(0.010, 0x165, "97001455e0001352"),
+    _frame(0.020, 0x165, "97001455e00013c3"),
+    _frame(0.030, 0x165, "97001455e000144e"),
+    _frame(0.041, 0x165, "97001455e0001372"),
+    _frame(0.050, 0x165, "97001455e0001340"),
+    _frame(0.060, 0x165, "97001455e00012f5"),
+    _frame(0.070, 0x165, "97001455e00012d9"),
+    _frame(0.080, 0x165, "97001455e00012d9"),
+    _frame(0.090, 0x165, "97001455e00012ab"),
+    _frame(0.101, 0x165, "97001455e000126b"),
+    _frame(0.110, 0x165, "97001455e0001216"),
+  ],
   "hold-on-shorthold-edge": [
     _frame(0.000, 0x43D, "001028a764c400e0"),
     _frame(0.010, 0x9D, "0001ffc000000000"),
