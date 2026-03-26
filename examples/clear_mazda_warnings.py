@@ -53,6 +53,8 @@ def parse_args() -> argparse.Namespace:
                       help="Override target UDS address. May be repeated. Defaults to 0x760, 0x706, 0x764.")
   parser.add_argument("--include-functional", action="store_true",
                       help="Also send a functional 0x7DF clear after individual ECU clears.")
+  parser.add_argument("--read-only", action="store_true",
+                      help="Read DTCs only and do not send any clear requests.")
   parser.add_argument("--skip-after-read", action="store_true",
                       help="Do not re-read DTCs after clearing.")
   parser.add_argument("--output", type=Path, default=default_output_path(),
@@ -148,11 +150,17 @@ def run(args: argparse.Namespace) -> None:
   print("Targets:", ", ".join(f"{hex(addr)} ({describe_addr(addr)})" for addr in addrs))
   if args.include_functional:
     print("Functional clear enabled: 0x7DF")
+  if args.read_only:
+    print("Read-only mode: no clear requests will be sent.")
   print()
 
   for addr in addrs:
     try_read_dtcs(panda, addr, args.bus, "Before clear")
     print()
+
+  if args.read_only:
+    print("Done. No clear requests were sent.")
+    return
 
   for addr in addrs:
     clear_dtcs(panda, addr, args.bus)
