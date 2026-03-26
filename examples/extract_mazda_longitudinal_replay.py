@@ -2,20 +2,41 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 from opendbc.can import CANParser
 from opendbc.car.logreader import LogReader
-from opendbc.car.mazda.longitudinal_experimental import (
-  MazdaLongitudinalCommandSet,
-  MazdaLongitudinalCommandStream,
-  MazdaLongitudinalProfile,
-  MazdaLongitudinalReplayMutator,
-  decode_signal,
-  matches_crz_info_checksum_guess,
-)
+
+try:
+  from opendbc.car.mazda.longitudinal_experimental import (
+    MazdaLongitudinalCommandSet,
+    MazdaLongitudinalCommandStream,
+    MazdaLongitudinalProfile,
+    MazdaLongitudinalReplayMutator,
+    decode_signal,
+    matches_crz_info_checksum_guess,
+  )
+except ModuleNotFoundError:
+  helper_path = Path(__file__).resolve().parents[1] / "opendbc" / "car" / "mazda" / "longitudinal_experimental.py"
+  if not helper_path.exists():
+    raise
+
+  spec = importlib.util.spec_from_file_location("mazda_longitudinal_experimental", helper_path)
+  if spec is None or spec.loader is None:
+    raise RuntimeError(f"Unable to load Mazda helper module from {helper_path}")
+  module = importlib.util.module_from_spec(spec)
+  sys.modules[spec.name] = module
+  spec.loader.exec_module(module)
+  MazdaLongitudinalCommandSet = module.MazdaLongitudinalCommandSet
+  MazdaLongitudinalCommandStream = module.MazdaLongitudinalCommandStream
+  MazdaLongitudinalProfile = module.MazdaLongitudinalProfile
+  MazdaLongitudinalReplayMutator = module.MazdaLongitudinalReplayMutator
+  decode_signal = module.decode_signal
+  matches_crz_info_checksum_guess = module.matches_crz_info_checksum_guess
 
 
 CANDIDATE_MESSAGES: tuple[tuple[str, int], ...] = (
