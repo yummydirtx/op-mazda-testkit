@@ -205,6 +205,8 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--radar-replay-capture-seconds", type=float, default=1.0,
                       help="How much pre-session radar traffic to capture for --replay-pre-session-radar")
   parser.add_argument("--replace-events", action="store_true", help="Also send 0x21f CRZ_EVENTS at 50 Hz, 10 ms ahead of 0x21b/0x21c")
+  parser.add_argument("--replace-events-after-standstill", action="store_true",
+                      help="Keep stock 0x21f alive until PEDALS.STANDSTILL=1 is observed, then begin overriding 0x21f.")
   parser.add_argument("--unsafe-patch-events", action="store_true", help="When overriding info_accel_cmd, also approximate-patch 0x21f. CRZ_EVENTS checksum semantics are still unresolved.")
   parser.add_argument("--target-speed-mph", type=float, help="Optional target set speed in mph. Requires --replace-events and --unsafe-patch-events.")
   parser.add_argument("--engage-button", choices=tuple(BUTTON_BY_NAME), default="none", help="Optional Mazda cruise button pulse to send after radar suppression starts. Keep cruise main on before starting the script.")
@@ -562,6 +564,9 @@ def run(args: argparse.Namespace) -> None:
   if args.target_speed_mph is not None and not args.unsafe_patch_events:
     print("--target-speed-mph requires --unsafe-patch-events because CRZ_SPEED lives in 0x21f.")
     sys.exit(1)
+  if args.replace_events_after_standstill and not args.replace_events:
+    print("--replace-events-after-standstill requires --replace-events.")
+    sys.exit(1)
   if (args.inject_stock_hold_21f_burst or args.inject_stock_release_21f_burst or args.unsafe_force_gas_maybe_stopgo) and not args.replace_events:
     print("0x21f stop/go experiments require --replace-events because they override CRZ_EVENTS during phase A.")
     sys.exit(1)
@@ -597,6 +602,7 @@ def run(args: argparse.Namespace) -> None:
     or args.inject_standstill_pedals
     or args.inject_standstill_pedals_latch
     or args.stock_stopgo_21c
+    or args.replace_events_after_standstill
     or args.inject_stock_hold_21f_burst
     or args.inject_stock_release_21f_burst
     or args.unsafe_force_gas_maybe_stopgo
@@ -681,6 +687,7 @@ def run(args: argparse.Namespace) -> None:
   stock_stopgo_release_until = 0.0
   stock_stopgo_21f_mode = "idle"
   stock_stopgo_21f_seq_index = 0
+  replace_events_enabled = not args.replace_events_after_standstill
 
   try:
     phase = 0
@@ -699,6 +706,11 @@ def run(args: argparse.Namespace) -> None:
         samples=active_samples,
         phase_start=start_time,
       )
+      if args.replace_events_after_standstill and not replace_events_enabled and status_parser is not None:
+        if int(status_parser.vl["PEDALS"]["STANDSTILL"]) == 1:
+          replace_events_enabled = True
+          phase = 0
+          print("PEDALS.STANDSTILL=1 observed; enabling 0x21f override path.")
       if standstill_sequence_armed and status_parser is not None and not standstill_sequence_started:
         if status_parser.vl["ENGINE_DATA"]["SPEED"] <= args.standstill_trigger_kph:
           standstill_sequence_started = True
@@ -760,12 +772,14 @@ def run(args: argparse.Namespace) -> None:
             press_end = 0.0
             next_press_start = now + args.engage_repeat_interval
 
-      if args.replace_events and phase == 0:
+      replace_events_active = args.replace_events and replace_events_enabled
+
+      if replace_events_active and phase == 0:
         last_command_set = mutator.next_command_set(
           profile=stream.profile,
           info_accel_cmd=args.info_accel_cmd,
           crz_speed_kph=target_speed_kph,
-          unsafe_patch_events=args.unsafe_patch_events,
+          unsafe_patch_events=args.unsafe_patch_events and replace_events_active,
         )
         if args.stock_stopgo_21c:
           last_command_set, stock_stopgo_hold_latched, stock_stopgo_release_until = apply_stock_stopgo_21c(
@@ -776,13 +790,14 @@ def run(args: argparse.Namespace) -> None:
             stock_stopgo_hold_latched,
             stock_stopgo_release_until,
           )
-        last_command_set, stock_stopgo_21f_mode, stock_stopgo_21f_seq_index = apply_stock_stopgo_21f(
-          last_command_set,
-          status_parser,
-          args,
-          stock_stopgo_21f_mode,
-          stock_stopgo_21f_seq_index,
-        )
+        if replace_events_active:
+          last_command_set, stock_stopgo_21f_mode, stock_stopgo_21f_seq_index = apply_stock_stopgo_21f(
+            last_command_set,
+            status_parser,
+            args,
+            stock_stopgo_21f_mode,
+            stock_stopgo_21f_seq_index,
+          )
         send_events(panda, args.bus, last_command_set)
         if sample_addrs:
           append_sample(active_tx_samples, CRZ_EVENTS_ADDR, last_command_set.raw_21f,
@@ -790,7 +805,7 @@ def run(args: argparse.Namespace) -> None:
         phase = 1
         next_send += 0.01
       else:
-        if not args.replace_events:
+        if not replace_events_active:
           last_command_set = mutator.next_command_set(
             profile=stream.profile,
             info_accel_cmd=args.info_accel_cmd,
@@ -806,16 +821,17 @@ def run(args: argparse.Namespace) -> None:
               stock_stopgo_hold_latched,
               stock_stopgo_release_until,
             )
-          last_command_set, stock_stopgo_21f_mode, stock_stopgo_21f_seq_index = apply_stock_stopgo_21f(
-            last_command_set,
-            status_parser,
-            args,
-            stock_stopgo_21f_mode,
-            stock_stopgo_21f_seq_index,
-          )
+          if replace_events_active:
+            last_command_set, stock_stopgo_21f_mode, stock_stopgo_21f_seq_index = apply_stock_stopgo_21f(
+              last_command_set,
+              status_parser,
+              args,
+              stock_stopgo_21f_mode,
+              stock_stopgo_21f_seq_index,
+            )
         if last_command_set is None:
           raise RuntimeError("No command set available for CRZ pair send")
-        elif args.replace_events and args.stock_stopgo_21c:
+        elif replace_events_active and args.stock_stopgo_21c:
           last_command_set, stock_stopgo_hold_latched, stock_stopgo_release_until = apply_stock_stopgo_21c(
             last_command_set,
             status_parser,
@@ -831,7 +847,7 @@ def run(args: argparse.Namespace) -> None:
           append_sample(active_tx_samples, CRZ_CTRL_ADDR, last_command_set.raw_21c,
                         phase_start=start_time, sample_limit=args.sample_limit, sample_addrs=sample_addrs)
         phase = 0
-        next_send += 0.02 if not args.replace_events else 0.01
+        next_send += 0.02 if not replace_events_active else 0.01
 
       sleep_time = next_send - time.monotonic()
       if sleep_time > 0:
@@ -862,7 +878,7 @@ def run(args: argparse.Namespace) -> None:
         profile=stream.profile,
         info_accel_cmd=args.info_accel_cmd,
         crz_speed_kph=target_speed_kph,
-        unsafe_patch_events=args.unsafe_patch_events if args.replace_events else False,
+        unsafe_patch_events=args.unsafe_patch_events if (args.replace_events and replace_events_enabled) else False,
       )
       if args.stock_stopgo_21c:
         last_command_set, stock_stopgo_hold_latched, stock_stopgo_release_until = apply_stock_stopgo_21c(
@@ -873,13 +889,14 @@ def run(args: argparse.Namespace) -> None:
           stock_stopgo_hold_latched,
           stock_stopgo_release_until,
         )
-      last_command_set, stock_stopgo_21f_mode, stock_stopgo_21f_seq_index = apply_stock_stopgo_21f(
-        last_command_set,
-        status_parser,
-        args,
-        stock_stopgo_21f_mode,
-        stock_stopgo_21f_seq_index,
-      )
+      if args.replace_events and replace_events_enabled:
+        last_command_set, stock_stopgo_21f_mode, stock_stopgo_21f_seq_index = apply_stock_stopgo_21f(
+          last_command_set,
+          status_parser,
+          args,
+          stock_stopgo_21f_mode,
+          stock_stopgo_21f_seq_index,
+        )
       handoff_phase = 0
       stock_pair_counts: Counter[int] = Counter()
       tracks_seen = False
@@ -907,6 +924,7 @@ def run(args: argparse.Namespace) -> None:
             announced_tracks = True
         stock_pair_counts[CRZ_INFO_ADDR] += handoff_seen[CRZ_INFO_ADDR]
         stock_pair_counts[CRZ_CTRL_ADDR] += handoff_seen[CRZ_CTRL_ADDR]
+        handoff_replace_events_active = args.replace_events and replace_events_enabled
         if handoff_ready(args.handoff_end_on, tracks_seen, stock_pair_counts, args.handoff_stock_pair_count):
           if args.handoff_end_on == "radar_tracks":
             print("Ending handoff: radar tracks detected again.")
@@ -922,7 +940,7 @@ def run(args: argparse.Namespace) -> None:
             )
           break
         if now >= next_handoff_send:
-          if args.replace_events and handoff_phase == 0:
+          if handoff_replace_events_active and handoff_phase == 0:
             last_command_set, stock_stopgo_21f_mode, stock_stopgo_21f_seq_index = apply_stock_stopgo_21f(
               last_command_set,
               status_parser,
@@ -953,7 +971,7 @@ def run(args: argparse.Namespace) -> None:
               append_sample(handoff_tx_samples, CRZ_CTRL_ADDR, last_command_set.raw_21c,
                             phase_start=handoff_start, sample_limit=args.sample_limit, sample_addrs=sample_addrs)
             handoff_phase = 0
-            next_handoff_send = now + (0.02 if not args.replace_events else 0.01)
+            next_handoff_send = now + (0.02 if not handoff_replace_events_active else 0.01)
         if radar_sequence is not None and now >= next_handoff_radar_send:
           current_snapshot = radar_sequence[handoff_radar_sequence_index]
           send_radar_snapshot(panda, args.bus, current_snapshot)
