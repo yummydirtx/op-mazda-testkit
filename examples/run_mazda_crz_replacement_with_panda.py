@@ -229,6 +229,8 @@ def parse_args() -> argparse.Namespace:
                       help="Below this speed, negative accel_cmd enters the stock HOLD-entry 0x21c state.")
   parser.add_argument("--stock-stopgo-holding-kph", type=float, default=0.05,
                       help="At or below this speed with STANDSTILL=1, enter the latched stock HOLD 0x21c state.")
+  parser.add_argument("--stock-stopgo-hold-entry-require-standstill", action="store_true",
+                      help="Require PEDALS.STANDSTILL=1 before entering the stock HOLD-entry 0x21c state.")
   parser.add_argument("--stock-stopgo-hold-entry-accel-cmd", type=float, default=-700.0,
                       help="Minimum 0x21b ACCEL_CMD required to arm the HOLD-entry 0x21c state.")
   parser.add_argument("--stock-stopgo-release-seconds", type=float, default=0.75,
@@ -245,6 +247,8 @@ def parse_args() -> argparse.Namespace:
                       help="Below this speed with negative ACCEL_CMD, arm the stock 0x21f hold-entry burst.")
   parser.add_argument("--hold-21f-latch-kph", type=float, default=0.05,
                       help="At or below this speed with STANDSTILL=1, force GAS_MAYBE=0 in --unsafe-force-gas-maybe-stopgo mode.")
+  parser.add_argument("--hold-21f-trigger-require-standstill", action="store_true",
+                      help="Require PEDALS.STANDSTILL=1 before arming the stock 0x21f hold-entry burst or gasmaybe stop/go patch.")
   parser.add_argument("--hold-21f-rearm-kph", type=float, default=3.0,
                       help="Above this speed, re-arm the stock 0x21f hold burst for another stop.")
   parser.add_argument("--log-file", type=Path, default=default_log_path(), help="Local file to append runner output to so logs survive SSH disconnects")
@@ -352,6 +356,9 @@ def apply_stock_stopgo_21c(command_set,
   gas = parser.vl["ENGINE_DATA"]["PEDAL_GAS"]
   resume_pressed = int(parser.vl["CRZ_BTNS"]["RES"]) == 1
   accel_cmd = decode_signal("CRZ_INFO", command_set.raw_21b, "ACCEL_CMD")
+  hold_entry_ready = speed_kph <= args.stock_stopgo_hold_entry_kph and accel_cmd <= args.stock_stopgo_hold_entry_accel_cmd
+  if args.stock_stopgo_hold_entry_require_standstill:
+    hold_entry_ready = hold_entry_ready and standstill
 
   if hold_latched and (resume_pressed or gas > args.stock_stopgo_release_gas_threshold or speed_kph > args.stock_stopgo_holding_kph):
     hold_latched = False
@@ -364,7 +371,7 @@ def apply_stock_stopgo_21c(command_set,
     raw_21c = overlay_raw_21c_mode(command_set.raw_21c, STOCK_STOPGO_CTRL_HOLD_LATCHED)
   elif release_until > now:
     raw_21c = overlay_raw_21c_mode(command_set.raw_21c, STOCK_STOPGO_CTRL_RELEASE)
-  elif speed_kph <= args.stock_stopgo_hold_entry_kph and accel_cmd <= args.stock_stopgo_hold_entry_accel_cmd:
+  elif hold_entry_ready:
     raw_21c = overlay_raw_21c_mode(command_set.raw_21c, STOCK_STOPGO_CTRL_HOLD_ENTRY)
   elif speed_kph <= args.stock_stopgo_stopping_kph and accel_cmd < 0:
     raw_21c = overlay_raw_21c_mode(command_set.raw_21c, STOCK_STOPGO_CTRL_STOPPING)
@@ -389,12 +396,15 @@ def apply_stock_stopgo_21f(command_set,
   gas = parser.vl["ENGINE_DATA"]["PEDAL_GAS"]
   resume_pressed = int(parser.vl["CRZ_BTNS"]["RES"]) == 1
   accel_cmd = decode_signal("CRZ_INFO", command_set.raw_21b, "ACCEL_CMD")
+  hold_trigger_ready = speed_kph <= args.hold_21f_trigger_kph and accel_cmd < 0
+  if args.hold_21f_trigger_require_standstill:
+    hold_trigger_ready = hold_trigger_ready and standstill
 
   if args.unsafe_force_gas_maybe_stopgo:
     gasmaybe_value: int | None = None
     if standstill and speed_kph <= args.hold_21f_latch_kph:
       gasmaybe_value = 0
-    elif speed_kph <= args.hold_21f_trigger_kph and accel_cmd < 0:
+    elif hold_trigger_ready:
       gasmaybe_value = 1
     elif (resume_pressed or gas > args.stock_stopgo_release_gas_threshold) and speed_kph <= args.hold_21f_trigger_kph:
       gasmaybe_value = 1
@@ -409,7 +419,7 @@ def apply_stock_stopgo_21f(command_set,
     mode = "idle"
     seq_index = 0
 
-  if mode == "idle" and speed_kph <= args.hold_21f_trigger_kph and accel_cmd < 0:
+  if mode == "idle" and hold_trigger_ready:
     mode = "hold_entry"
     seq_index = 0
   elif mode == "done" and args.inject_stock_release_21f_burst and (resume_pressed or gas > args.stock_stopgo_release_gas_threshold):
@@ -578,7 +588,19 @@ def run(args: argparse.Namespace) -> None:
   panda = Panda()
   panda.set_can_speed_kbps(args.bus, args.can_speed_kbps)
   panda.set_safety_mode(CarParams.SafetyModel.allOutput)
-  status_parser = CANParser("mazda_2017", list(STATUS_MESSAGES), args.bus) if (args.status_interval > 0 or args.inject_standstill_pedals or args.inject_standstill_pedals_latch or args.stock_stopgo_21c) else None
+  status_parser = CANParser(
+    "mazda_2017",
+    list(STATUS_MESSAGES),
+    args.bus,
+  ) if (
+    args.status_interval > 0
+    or args.inject_standstill_pedals
+    or args.inject_standstill_pedals_latch
+    or args.stock_stopgo_21c
+    or args.inject_stock_hold_21f_burst
+    or args.inject_stock_release_21f_burst
+    or args.unsafe_force_gas_maybe_stopgo
+  ) else None
   rx_counts: Counter[int] = Counter()
   phase_samples: dict[str, dict[str, list[dict[str, object]]]] = {}
   tx_phase_samples: dict[str, dict[str, list[dict[str, object]]]] = {}
@@ -634,11 +656,15 @@ def run(args: argparse.Namespace) -> None:
       f"hold-entry<={args.stock_stopgo_hold_entry_kph:.2f}kph, "
       f"latched-hold<={args.stock_stopgo_holding_kph:.2f}kph."
     )
+    if args.stock_stopgo_hold_entry_require_standstill:
+      print("Stock 0x21c HOLD-entry is gated on PEDALS.STANDSTILL=1.")
   if args.inject_stock_hold_21f_burst:
     print(
       "Stock stop/HOLD 0x21f burst enabled: "
       f"trigger<={args.hold_21f_trigger_kph:.2f}kph, rearm>{args.hold_21f_rearm_kph:.2f}kph."
     )
+    if args.hold_21f_trigger_require_standstill:
+      print("Stock 0x21f HOLD-entry burst is gated on PEDALS.STANDSTILL=1.")
   if args.unsafe_force_gas_maybe_stopgo:
     print(
       "Unsafe CRZ_EVENTS.GAS_MAYBE stop/go patch enabled: "
