@@ -256,6 +256,12 @@ def parse_args() -> argparse.Namespace:
                       help="Require PEDALS.STANDSTILL=1 before arming the stock 0x21f hold-entry burst or gasmaybe stop/go patch.")
   parser.add_argument("--hold-21f-rearm-kph", type=float, default=3.0,
                       help="Above this speed, re-arm the stock 0x21f hold burst for another stop.")
+  parser.add_argument("--unsafe-force-traction-brake-stopgo", action="store_true",
+                      help="Unsafely patch live 0x415 TRACTION.BRAKE=1 and IS_MOVING=0 after a true stop. TRACTION checksum semantics remain unresolved.")
+  parser.add_argument("--traction-hold-kph", type=float, default=0.0,
+                      help="At or below this speed, patch live 0x415 TRACTION for post-stop hold experiments.")
+  parser.add_argument("--traction-trigger-require-standstill", action="store_true",
+                      help="Require PEDALS.STANDSTILL=1 before patching live 0x415 TRACTION for stop/go experiments.")
   parser.add_argument("--log-file", type=Path, default=default_log_path(), help="Local file to append runner output to so logs survive SSH disconnects")
   parser.add_argument("--sample-output", type=Path,
                       help="Optional JSON artifact path for timestamped raw-frame samples from active and handoff phases")
@@ -326,6 +332,10 @@ def send_events(panda: Panda, bus: int, command_set) -> None:
     ],
     timeout=0,
   )
+
+
+def send_traction(panda: Panda, bus: int, raw_415: bytes) -> None:
+  panda.can_send(0x415, raw_415, bus)
 
 
 def send_button_press(panda: Panda, bus: int, packer: CANPacker, counter: int, button: int) -> None:
@@ -458,6 +468,24 @@ def apply_stock_stopgo_21f(command_set,
   return command_set, mode, seq_index
 
 
+def apply_stock_stopgo_415(raw_415: bytes | None,
+                           parser: CANParser | None,
+                           args: argparse.Namespace) -> bytes | None:
+  if raw_415 is None or parser is None:
+    return None
+
+  speed_kph = parser.vl["ENGINE_DATA"]["SPEED"]
+  standstill = int(parser.vl["PEDALS"]["STANDSTILL"]) == 1
+  if speed_kph > args.traction_hold_kph:
+    return None
+  if args.traction_trigger_require_standstill and not standstill:
+    return None
+
+  patched = patch_signal("TRACTION", raw_415, "BRAKE", 1)
+  patched = patch_signal("TRACTION", patched, "IS_MOVING", 0)
+  return patched
+
+
 def drain_can(panda: Panda,
               bus: int,
               parser: CANParser | None,
@@ -466,7 +494,9 @@ def drain_can(panda: Panda,
               sample_addrs: set[int] | None = None,
               sample_limit: int = 0,
               samples: dict[int, list[dict[str, object]]] | None = None,
-              phase_start: float | None = None) -> Counter[int]:
+              phase_start: float | None = None,
+              latest_frames: dict[int, bytes] | None = None,
+              latest_frame_times: dict[int, float] | None = None) -> Counter[int]:
   frames = []
   seen_addrs: Counter[int] = Counter()
   now = time.monotonic()
@@ -475,9 +505,14 @@ def drain_can(panda: Panda,
       continue
     rx_counts[addr] += 1
     seen_addrs[addr] += 1
-    frames.append((addr, bytes(dat), src))
+    raw_dat = bytes(dat)
+    frames.append((addr, raw_dat, src))
+    if latest_frames is not None:
+      latest_frames[addr] = raw_dat
+    if latest_frame_times is not None:
+      latest_frame_times[addr] = now
     if sample_addrs and samples is not None and phase_start is not None and addr in sample_addrs and len(samples[addr]) < sample_limit:
-      samples[addr].append({"t": round(now - phase_start, 6), "data": bytes(dat).hex()})
+      samples[addr].append({"t": round(now - phase_start, 6), "data": raw_dat.hex()})
   if parser is not None and frames:
     parser.update((int(now * 1e9), frames))
   return seen_addrs
@@ -616,10 +651,13 @@ def run(args: argparse.Namespace) -> None:
     or args.inject_stock_hold_21f_burst
     or args.inject_stock_release_21f_burst
     or args.unsafe_force_gas_maybe_stopgo
+    or args.unsafe_force_traction_brake_stopgo
   ) else None
   rx_counts: Counter[int] = Counter()
   phase_samples: dict[str, dict[str, list[dict[str, object]]]] = {}
   tx_phase_samples: dict[str, dict[str, list[dict[str, object]]]] = {}
+  latest_rx_frames: dict[int, bytes] = {}
+  latest_rx_frame_times: dict[int, float] = {}
 
   radar_sequence: list[dict[int, bytes]] | None = None
   if args.replay_pre_session_radar:
@@ -686,6 +724,13 @@ def run(args: argparse.Namespace) -> None:
       "Unsafe CRZ_EVENTS.GAS_MAYBE stop/go patch enabled: "
       f"trigger<={args.hold_21f_trigger_kph:.2f}kph, latch<={args.hold_21f_latch_kph:.2f}kph."
     )
+  if args.unsafe_force_traction_brake_stopgo:
+    print(
+      "Unsafe TRACTION stop/go patch enabled: "
+      f"hold<={args.traction_hold_kph:.2f}kph."
+    )
+    if args.traction_trigger_require_standstill:
+      print("TRACTION patch is gated on PEDALS.STANDSTILL=1.")
   print("Press Ctrl-C to stop.")
   standstill_sequence_armed = args.inject_standstill_pedals
   standstill_sequence_started = False
@@ -698,6 +743,7 @@ def run(args: argparse.Namespace) -> None:
   stock_stopgo_21f_mode = "idle"
   stock_stopgo_21f_seq_index = 0
   replace_events_enabled = not (args.replace_events_after_standstill or args.replace_events_after_zero_speed)
+  last_traction_patch_rx_time = -1.0
   stop_requested = False
 
   def request_stop(signum, _frame) -> None:
@@ -729,6 +775,8 @@ def run(args: argparse.Namespace) -> None:
         sample_limit=args.sample_limit,
         samples=active_samples,
         phase_start=start_time,
+        latest_frames=latest_rx_frames,
+        latest_frame_times=latest_rx_frame_times,
       )
       if not replace_events_enabled and status_parser is not None:
         if args.replace_events_after_standstill and int(status_parser.vl["PEDALS"]["STANDSTILL"]) == 1:
@@ -799,6 +847,18 @@ def run(args: argparse.Namespace) -> None:
           if now >= press_end:
             press_end = 0.0
             next_press_start = now + args.engage_repeat_interval
+
+      if args.unsafe_force_traction_brake_stopgo:
+        latest_415 = latest_rx_frames.get(0x415)
+        latest_415_time = latest_rx_frame_times.get(0x415, -1.0)
+        if latest_415 is not None and latest_415_time != last_traction_patch_rx_time:
+          patched_415 = apply_stock_stopgo_415(latest_415, status_parser, args)
+          if patched_415 is not None:
+            send_traction(panda, args.bus, patched_415)
+            if sample_addrs:
+              append_sample(active_tx_samples, 0x415, patched_415,
+                            phase_start=start_time, sample_limit=args.sample_limit, sample_addrs=sample_addrs)
+            last_traction_patch_rx_time = latest_415_time
 
       replace_events_active = args.replace_events and replace_events_enabled
 
