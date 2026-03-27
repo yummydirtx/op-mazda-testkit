@@ -262,6 +262,8 @@ def parse_args() -> argparse.Namespace:
                       help="At or below this speed, patch live 0x415 TRACTION for post-stop hold experiments.")
   parser.add_argument("--traction-trigger-require-standstill", action="store_true",
                       help="Require PEDALS.STANDSTILL=1 before patching live 0x415 TRACTION for stop/go experiments.")
+  parser.add_argument("--stopgo-arm-after-moving-kph", type=float, default=1.0,
+                      help="Require ENGINE_DATA speed to first exceed this threshold after launch before any delayed post-stop experiment can arm.")
   parser.add_argument("--log-file", type=Path, default=default_log_path(), help="Local file to append runner output to so logs survive SSH disconnects")
   parser.add_argument("--sample-output", type=Path,
                       help="Optional JSON artifact path for timestamped raw-frame samples from active and handoff phases")
@@ -626,6 +628,9 @@ def run(args: argparse.Namespace) -> None:
   if args.standstill_repeat < 1:
     print("--standstill-repeat must be >= 1.")
     sys.exit(1)
+  if args.stopgo_arm_after_moving_kph < 0:
+    print("--stopgo-arm-after-moving-kph must be >= 0.")
+    sys.exit(1)
 
   ensure_pandad_stopped()
   stream = load_stream(args.stream_json, args.profile)
@@ -731,6 +736,17 @@ def run(args: argparse.Namespace) -> None:
     )
     if args.traction_trigger_require_standstill:
       print("TRACTION patch is gated on PEDALS.STANDSTILL=1.")
+  stopgo_arm_required = (
+    args.replace_events_after_standstill
+    or args.replace_events_after_zero_speed
+    or args.unsafe_force_traction_brake_stopgo
+  )
+  stopgo_experiments_armed = not stopgo_arm_required or args.stopgo_arm_after_moving_kph <= 0
+  if stopgo_arm_required and not stopgo_experiments_armed:
+    print(
+      "Delayed stop/go experiments will arm only after "
+      f"ENGINE_DATA.SPEED exceeds {args.stopgo_arm_after_moving_kph:.2f} kph."
+    )
   print("Press Ctrl-C to stop.")
   standstill_sequence_armed = args.inject_standstill_pedals
   standstill_sequence_started = False
@@ -778,7 +794,14 @@ def run(args: argparse.Namespace) -> None:
         latest_frames=latest_rx_frames,
         latest_frame_times=latest_rx_frame_times,
       )
-      if not replace_events_enabled and status_parser is not None:
+      if status_parser is not None and not stopgo_experiments_armed:
+        if status_parser.vl["ENGINE_DATA"]["SPEED"] >= args.stopgo_arm_after_moving_kph:
+          stopgo_experiments_armed = True
+          print(
+            "ENGINE_DATA.SPEED exceeded "
+            f"{args.stopgo_arm_after_moving_kph:.2f} kph; delayed stop/go experiments are now armed."
+          )
+      if not replace_events_enabled and status_parser is not None and stopgo_experiments_armed:
         if args.replace_events_after_standstill and int(status_parser.vl["PEDALS"]["STANDSTILL"]) == 1:
           replace_events_enabled = True
           phase = 0
@@ -848,7 +871,7 @@ def run(args: argparse.Namespace) -> None:
             press_end = 0.0
             next_press_start = now + args.engage_repeat_interval
 
-      if args.unsafe_force_traction_brake_stopgo:
+      if args.unsafe_force_traction_brake_stopgo and stopgo_experiments_armed:
         latest_415 = latest_rx_frames.get(0x415)
         latest_415_time = latest_rx_frame_times.get(0x415, -1.0)
         if latest_415 is not None and latest_415_time != last_traction_patch_rx_time:
