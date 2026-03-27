@@ -5,6 +5,7 @@ import argparse
 import datetime as dt
 import importlib.util
 import json
+import signal
 import sys
 import time
 import traceback
@@ -207,6 +208,8 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--replace-events", action="store_true", help="Also send 0x21f CRZ_EVENTS at 50 Hz, 10 ms ahead of 0x21b/0x21c")
   parser.add_argument("--replace-events-after-standstill", action="store_true",
                       help="Keep stock 0x21f alive until PEDALS.STANDSTILL=1 is observed, then begin overriding 0x21f.")
+  parser.add_argument("--replace-events-after-zero-speed", action="store_true",
+                      help="Keep stock 0x21f alive until ENGINE_DATA.SPEED reaches 0.00 kph, then begin overriding 0x21f.")
   parser.add_argument("--unsafe-patch-events", action="store_true", help="When overriding info_accel_cmd, also approximate-patch 0x21f. CRZ_EVENTS checksum semantics are still unresolved.")
   parser.add_argument("--target-speed-mph", type=float, help="Optional target set speed in mph. Requires --replace-events and --unsafe-patch-events.")
   parser.add_argument("--engage-button", choices=tuple(BUTTON_BY_NAME), default="none", help="Optional Mazda cruise button pulse to send after radar suppression starts. Keep cruise main on before starting the script.")
@@ -567,6 +570,12 @@ def run(args: argparse.Namespace) -> None:
   if args.replace_events_after_standstill and not args.replace_events:
     print("--replace-events-after-standstill requires --replace-events.")
     sys.exit(1)
+  if args.replace_events_after_zero_speed and not args.replace_events:
+    print("--replace-events-after-zero-speed requires --replace-events.")
+    sys.exit(1)
+  if args.replace_events_after_standstill and args.replace_events_after_zero_speed:
+    print("Use only one of --replace-events-after-standstill or --replace-events-after-zero-speed.")
+    sys.exit(1)
   if (args.inject_stock_hold_21f_burst or args.inject_stock_release_21f_burst or args.unsafe_force_gas_maybe_stopgo) and not args.replace_events:
     print("0x21f stop/go experiments require --replace-events because they override CRZ_EVENTS during phase A.")
     sys.exit(1)
@@ -603,6 +612,7 @@ def run(args: argparse.Namespace) -> None:
     or args.inject_standstill_pedals_latch
     or args.stock_stopgo_21c
     or args.replace_events_after_standstill
+    or args.replace_events_after_zero_speed
     or args.inject_stock_hold_21f_burst
     or args.inject_stock_release_21f_burst
     or args.unsafe_force_gas_maybe_stopgo
@@ -687,14 +697,28 @@ def run(args: argparse.Namespace) -> None:
   stock_stopgo_release_until = 0.0
   stock_stopgo_21f_mode = "idle"
   stock_stopgo_21f_seq_index = 0
-  replace_events_enabled = not args.replace_events_after_standstill
+  replace_events_enabled = not (args.replace_events_after_standstill or args.replace_events_after_zero_speed)
+  stop_requested = False
+
+  def request_stop(signum, _frame) -> None:
+    nonlocal stop_requested
+    signame = signal.Signals(signum).name
+    if stop_requested:
+      raise KeyboardInterrupt
+    stop_requested = True
+    print(f"{signame} received; stopping cleanly after the current loop and writing artifacts. Press Ctrl-C again to force abort.")
+
+  old_sigint = signal.getsignal(signal.SIGINT)
+  old_sigterm = signal.getsignal(signal.SIGTERM)
+  signal.signal(signal.SIGINT, request_stop)
+  signal.signal(signal.SIGTERM, request_stop)
 
   try:
     phase = 0
     last_command_set = None
     active_samples: dict[int, list[dict[str, object]]] = defaultdict(list)
     active_tx_samples: dict[int, list[dict[str, object]]] = defaultdict(list)
-    while args.duration == 0 or (time.monotonic() - start_time) < args.duration:
+    while not stop_requested and (args.duration == 0 or (time.monotonic() - start_time) < args.duration):
       now = time.monotonic()
       drain_can(
         panda,
@@ -706,11 +730,15 @@ def run(args: argparse.Namespace) -> None:
         samples=active_samples,
         phase_start=start_time,
       )
-      if args.replace_events_after_standstill and not replace_events_enabled and status_parser is not None:
-        if int(status_parser.vl["PEDALS"]["STANDSTILL"]) == 1:
+      if not replace_events_enabled and status_parser is not None:
+        if args.replace_events_after_standstill and int(status_parser.vl["PEDALS"]["STANDSTILL"]) == 1:
           replace_events_enabled = True
           phase = 0
           print("PEDALS.STANDSTILL=1 observed; enabling 0x21f override path.")
+        elif args.replace_events_after_zero_speed and status_parser.vl["ENGINE_DATA"]["SPEED"] <= 0.0:
+          replace_events_enabled = True
+          phase = 0
+          print("ENGINE_DATA.SPEED reached 0.00 kph; enabling 0x21f override path.")
       if standstill_sequence_armed and status_parser is not None and not standstill_sequence_started:
         if status_parser.vl["ENGINE_DATA"]["SPEED"] <= args.standstill_trigger_kph:
           standstill_sequence_started = True
@@ -860,10 +888,12 @@ def run(args: argparse.Namespace) -> None:
           print_tx_status(f"t+{now - start_time:.1f}s", last_command_set)
         next_status = now + args.status_interval
 
-    if args.handoff_seconds > 0:
-      if sample_addrs:
-        phase_samples["active"] = finalize_phase_samples(active_samples)
-        tx_phase_samples["active"] = finalize_phase_samples(active_tx_samples)
+    if sample_addrs:
+      phase_samples["active"] = finalize_phase_samples(active_samples)
+      tx_phase_samples["active"] = finalize_phase_samples(active_tx_samples)
+    if stop_requested and args.handoff_seconds > 0:
+      print("Skipping exit handoff because manual stop was requested.")
+    elif args.handoff_seconds > 0:
       print(f"Starting exit handoff for up to {args.handoff_seconds:.1f}s.")
       print(
         f"Handoff will end on {args.handoff_end_on} "
@@ -905,7 +935,7 @@ def run(args: argparse.Namespace) -> None:
       handoff_tx_samples: dict[int, list[dict[str, object]]] = defaultdict(list)
       handoff_start = time.monotonic()
 
-      while time.monotonic() < handoff_deadline:
+      while not stop_requested and time.monotonic() < handoff_deadline:
         now = time.monotonic()
         handoff_seen = drain_can(
           panda,
@@ -989,10 +1019,7 @@ def run(args: argparse.Namespace) -> None:
       if sample_addrs:
         phase_samples["handoff"] = finalize_phase_samples(handoff_samples)
         tx_phase_samples["handoff"] = finalize_phase_samples(handoff_tx_samples)
-    elif sample_addrs:
-      phase_samples["active"] = finalize_phase_samples(active_samples)
-      tx_phase_samples["active"] = finalize_phase_samples(active_tx_samples)
-    if args.exit_default_session:
+    if args.exit_default_session and not stop_requested:
       try:
         print("Requesting radar return to UDS default session.")
         client.diagnostic_session_control(uds.SESSION_TYPE.DEFAULT)
@@ -1023,6 +1050,8 @@ def run(args: argparse.Namespace) -> None:
       args.sample_output.write_text(json.dumps(sample_payload, indent=2) + "\n")
       print(f"Wrote phase samples JSON to {args.sample_output}")
   finally:
+    signal.signal(signal.SIGINT, old_sigint)
+    signal.signal(signal.SIGTERM, old_sigterm)
     panda.set_safety_mode(CarParams.SafetyModel.silent)
     print("Panda returned to silent safety mode.")
 
